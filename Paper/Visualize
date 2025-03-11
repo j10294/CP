@@ -1,4 +1,5 @@
 library(ggplot2)
+library(gridExtra)
 
 # 플로팅 함수
 plot_model_results <- function(monte_carlo_results, model_num) {
@@ -45,3 +46,18 @@ plot_model_results <- function(monte_carlo_results, model_num) {
   grid.arrange(model_title, do.call(arrangeGrob, c(plot_list, ncol = 2)),
                ncol = 1, heights = c(0.2, 5))
 }
+
+# 특정 모델에 대한 플롯을 그리고 저장하는 함수
+save_plot_model_results_combined <- function(monte_carlo_results, model_num, filename, width=10, height=8, dpi=300){
+  # 기존 plot_model_results_combined 함수를 활용하여 그래프 생성
+  plot_grob <- plot_model_results(monte_carlo_results, model_num)
+  
+  # ggsave를 사용하여 그래프 저장 
+  ggsave(filename, plot=plot_grob, width=width, height=height, dpi=dpi)
+  
+  print(paste("Saved:", filename))  
+}
+
+# 각 모델별 그래프 저장
+save_plot_model_results_combined(monte_carlo_results, model_num = 1, filename="0224_paper_k직접계산_model1.png")
+save_plot_model_results_combined(monte_carlo_results, model_num = 2, filename="0224_paper_k직접계산_model2.png")
