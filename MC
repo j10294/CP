@@ -1,0 +1,142 @@
+
+# Monte Carlo 실행
+set.seed(123)
+M <- 500
+models <- c(1, 2, 3, 4)
+sample_sizes <- c(50, 100, 200)
+
+results <- transform_function(models, sample_sizes, M, seed = 123)
+transformed_results <- results$transformed
+raw_results <- results$raw
+
+monte_carlo_results <- list()
+
+for (model in models) {
+  for (m in sample_sizes) {
+    transformed_data <- transformed_results[[paste0("Model_", model, "_m_", m)]]
+    raw_data <- raw_results[[paste0("Model_", model, "_m_", m)]]
+    
+    mc_start_time <- Sys.time()  # MC 실행 시작시간 기록
+    coverage_matrix <- matrix(0, nrow = m, ncol = M)
+    width_matrix <- matrix(0, nrow = m, ncol = M)
+    variance_estimates <- numeric(M)
+    nu_values <- numeric(M)
+    k_matrix <- matrix(0, nrow=m, ncol=M)
+    
+    for (i in 1:M) {
+      x <- raw_data[[i]]$x
+      y <- transformed_data[, i]
+      fit <- smooth.spline(x = x, y = y, cv = FALSE)
+      mean_lambda <- mean(fit$lambda, na.rm = TRUE)
+      
+      raw_y <- raw_data[[i]]$y
+      variance_hat <- raw_data[[i]]$variance_hat
+      
+      fit <- smooth.spline(x = x, y = y, spar = mean_lambda)
+      pred_y <- predict(fit, x)$y
+      residuals <- y - pred_y
+      
+      B <- bs(x, df=fit$df)
+      D <- diff(diag(ncol(B)), differences=2)
+      S_inv <- ginv(t(B) %*% B + mean_lambda * t(D) %*% D)
+      smoother_matrix <- B %*% S_inv %*% t(B)
+      I_n <- diag(m)
+      residual_matrix <- I_n - smoother_matrix
+      estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
+      if (is.na(estimated_variance) || is.nan(estimated_variance) || is.infinite(estimated_variance)) {
+        estimated_variance <- 1e-6
+      }
+      variance_estimates[i] <- estimated_variance
+      
+      #전체 x값에 대해 smoothing vector과 해당되는 norm 계산
+      norm_lx_h_values <- numeric(m)
+      
+      for (j in 1:m){
+        x_h <- x[j]
+        smoothing_vector <- smoother_matrix[j,]
+        norm_lx_h_values[j] <- compute_norm(smoothing_vector)
+      }
+      
+      # k factor 계산 (find_k_factor 함수 이용, nu는 데이터에서 직접 계산)
+      numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+      denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+      nu <- numerator / denominator
+      nu_values[i] <- nu  
+      
+      k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu=nu, norm_lx_h = nlh))
+      
+      TI_upper <- pred_y + estimated_variance * k_factors
+      TI_lower <- pred_y - estimated_variance * k_factors
+      
+      TI_upper <- TI_upper * sqrt(variance_hat)
+      TI_lower <- TI_lower * sqrt(variance_hat)
+      
+      coverage_matrix[,i] <- (raw_y >= TI_lower) & (raw_y <= TI_upper)
+      width_matrix[,i] <- TI_upper - TI_lower
+      k_matrix[,i] <- k_factors
+    }
+    # MC 실행 종료시간 기록
+    mc_end_time <- Sys.time()
+    mc_duration <- difftime(mc_end_time, mc_start_time, units='mins')
+    cat(sprintf('Monte Carlo simulation time : %.2f minutes\n', mc_duration))
+    
+    # Coverage, Width 평균 계산
+    coverage_probabilities <- rowMeans(coverage_matrix)
+    mean_width <- rowMeans(width_matrix)
+    
+    # 결과 저장
+    monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+      data.frame(x = x, coverage_probabilities = coverage_probabilities, mean_width = mean_width)
+  }
+}
+
+# 플로팅 함수 수정
+plot_model_results <- function(monte_carlo_results, model_num) {
+  plot_list <- list()
+  
+  # 특정 모델의 결과만 필터링
+  model_results <- monte_carlo_results[grep(paste0("Model_", model_num, "_"), names(monte_carlo_results))]
+  
+  for (i in seq_along(model_results)) {
+    res <- model_results[[i]]
+    coverage_data <- data.frame(
+      x = res$x,
+      covered = res$coverage_probabilities,
+      width = res$mean_width
+    )
+    
+    # NA 제거
+    coverage_data <- na.omit(coverage_data)
+    
+    # 1️⃣Pointwise Coverage Plot
+    p1 <- ggplot(coverage_data, aes(x = x, y = covered)) +
+      geom_point(color = 'red') +
+      geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'black') +
+      labs(title = paste("Pointwise Coverage (Model", model_num, ")"),
+           x = "x", y = "Coverage Probability") +
+      ylim(0, 1) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+    
+    # 2️⃣ Interval Width Plot
+    p2 <- ggplot(coverage_data, aes(x = x, y = width)) +
+      geom_point(size = 0.5, na.rm = TRUE, color = 'blue') +
+      labs(title = paste("Interval Width (Model", model_num, ")"),
+           x = "x", y = "Interval Width") +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+    
+    plot_list <- append(plot_list, list(p1, p2))
+  }
+  
+  model_title <- textGrob(paste("Model", model_num), gp = gpar(fontsize = 13, fontface = "bold"))
+  
+  # 그래프 2열로 배치 (Coverage와 Width)
+  grid.arrange(model_title, do.call(arrangeGrob, c(plot_list, ncol = 2)),
+               ncol = 1, heights = c(0.2, 5))
+}
+
+plot_model_results(monte_carlo_results, 1)
+plot_model_results(monte_carlo_results, 2)
+plot_model_results(monte_carlo_results, 3)
+plot_model_results(monte_carlo_results, 4)
