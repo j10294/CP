@@ -58,6 +58,3 @@ save_plot_model_results_combined <- function(monte_carlo_results, model_num, fil
   print(paste("Saved:", filename))  
 }
 
-# 각 모델별 그래프 저장
-save_plot_model_results_combined(monte_carlo_results, model_num = 1, filename="0224_paper_k직접계산_model1.png")
-save_plot_model_results_combined(monte_carlo_results, model_num = 2, filename="0224_paper_k직접계산_model2.png")
