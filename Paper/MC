@@ -1,18 +1,16 @@
 library(splines)
 
-
 # Monte Carlo 실행
 set.seed(123)
 M <- 500
 models <- c(1, 2, 3, 4)
 sample_sizes <- c(50, 100, 200)
-
 results <- transform_function(models, sample_sizes, M, seed = 123)
+
 transformed_results <- results$transformed
 raw_results <- results$raw
 
 monte_carlo_results <- list()
-
 for (model in models) {
   for (m in sample_sizes) {
     transformed_data <- transformed_results[[paste0("Model_", model, "_m_", m)]]
@@ -25,19 +23,33 @@ for (model in models) {
     nu_values <- numeric(M)
     k_matrix <- matrix(0, nrow=m, ncol=M)
     
+    lambda_values <- numeric(M)
+    
     for (i in 1:M) {
+      #mean_lambda 계산을 위한 MC Simulation
       x <- raw_data[[i]]$x
       y <- transformed_data[, i]
       fit <- smooth.spline(x = x, y = y, cv = FALSE)
-      mean_lambda <- mean(fit$lambda, na.rm = TRUE)
+      
+      lambda_values[i] <- fit$lambda
+    }
+    
+    mean_lambda <- mean(lambda_values, na.rm=TRUE)
+      
+    for (i in 1:M){
+      
+      #MC Simulation 시작
+      x <- raw_data[[i]]$x
+      y <- transformed_data[,i]
+      fit <- smooth.spline(x=x, y=y, spar=mean_lambda)
       
       raw_y <- raw_data[[i]]$y
       variance_hat <- raw_data[[i]]$variance_hat
       
-      fit <- smooth.spline(x = x, y = y, spar = mean_lambda)
       pred_y <- predict(fit, x)$y
-      residuals <- y - pred_y
+      residuals <- y - pred_y 
       
+      #분산 계산
       B <- bs(x, df=fit$df)
       D <- diff(diag(ncol(B)), differences=2)
       S_inv <- ginv(t(B) %*% B + mean_lambda * t(D) %*% D)
@@ -47,7 +59,7 @@ for (model in models) {
       estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
       if (is.na(estimated_variance) || is.nan(estimated_variance) || is.infinite(estimated_variance)) {
         estimated_variance <- 1e-6
-      }
+      } #결측치는 매우 작은 분산으로 수정 -> TI 크기가 거의 0에 가깝게 됨.
       variance_estimates[i] <- estimated_variance
       
       #전체 x값에 대해 smoothing vector과 해당되는 norm 계산
@@ -58,7 +70,7 @@ for (model in models) {
         smoothing_vector <- smoother_matrix[j,]
         norm_lx_h_values[j] <- compute_norm(smoothing_vector)
       }
-      
+        
       # k factor 계산 (find_k_factor 함수 이용, nu는 데이터에서 직접 계산)
       numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
       denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
@@ -77,6 +89,7 @@ for (model in models) {
       width_matrix[,i] <- TI_upper - TI_lower
       k_matrix[,i] <- k_factors
     }
+    
     # MC 실행 종료시간 기록
     mc_end_time <- Sys.time()
     mc_duration <- difftime(mc_end_time, mc_start_time, units='mins')
