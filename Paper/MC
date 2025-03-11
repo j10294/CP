@@ -1,3 +1,5 @@
+library(splines)
+
 
 # Monte Carlo 실행
 set.seed(123)
