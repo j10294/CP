@@ -1,0 +1,116 @@
+library(splines)
+library(ggplot2)
+
+# 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  x <- seq(0, 10, length.out = n)
+  if (model == 1) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  }
+  return(data.frame(x = x, y = y))
+}
+
+# lambda_hat을 찾는 함수
+find_lambda_hat <- function(alpha, delta, y, mean_pred, variance, n, lower=0, upper=5){
+  f <- function(lambda, alpha, delta, y, mean_pred, variance, n){
+    risk <- mean(y <= mean_pred - sqrt(variance)*lambda |
+                   y >= mean_pred + sqrt(variance)*lambda, na.rm=TRUE) 
+    threshold <- (1-alpha) - sqrt(log(1/delta) / (2*n))
+    return(risk - threshold)
+  }
+  
+  lambda_hat <- tryCatch({
+    uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta, 
+            y=y, mean_pred = mean_pred, variance=variance, n=n)$root
+  }, error=function(e){
+    optimize_lambda <- function(lambda) f(lambda, alpha, delta, y, mean_pred, variance, n)
+    optimize(optimize_lambda, interval = c(lower, upper))$minimum
+  })
+  return(lambda_hat)
+}
+
+
+# 실험 실행 함수 (한 번 실행)
+run_experiment <- function(model, m){
+  data <- generate_data(model, m)
+  
+  # 데이터 분할
+  train_ratio <- 0.5
+  n <- floor(train_ratio * m)
+  train_index <- sample(seq_len(m), size=n)
+  
+  train_data <- data[train_index,]
+  test_data <- data[-train_index,]
+  
+  train_x <- train_data$x
+  train_y <- train_data$y
+  
+  test_x <- test_data$x
+  test_y <- test_data$y
+  
+  # f(x) 추정
+  spline_model_mean <- smooth.spline(train_x, train_y)
+  train_y_pred <- predict(spline_model_mean, train_x)$y
+  train_residuals <- train_y - train_y_pred
+  
+  test_y_pred <- predict(spline_model_mean, test_x)$y
+  
+  # loess 를 이용한 분산 추정
+  loess_variance_model <- loess((train_residuals)^2~ train_x, span=0.5)
+  test_variance_pred <- predict(loess_variance_model, newdata=data.frame(train_x = test_x))
+  
+  
+  # lambda_hat 추정
+  alpha <- 0.95
+  delta <- 0.90
+  lambda_hat <- find_lambda_hat(alpha, delta, test_y, test_y_pred, test_variance_pred, length(test_y))
+  
+  # Tolerance Interval 계산
+  upper <- test_y_pred + lambda_hat * sqrt(test_variance_pred)
+  lower <- test_y_pred - lambda_hat * sqrt(test_variance_pred)
+  
+  # Tolerance Interval Width 계산
+  width <- 2*lambda_hat*sqrt(test_variance_pred)
+  
+  # 각 x값에 대한 커버리지 저장
+  coverage_per_x <- data.frame(x = test_x, covered = (test_y >= lower & test_y <= upper), width=width)
+  
+  return(coverage_per_x)
+}
+
+
+# M=500번 반복 실행하여 커버리지 평균 계산하는 함수
+run_monte_carlo <- function(model, m, M=500){
+  all_results <- data.frame()
+  
+  for (i in 1:M) {
+    cat(sprintf("Model %d, m=%d, Iteration %d/%d\n", model, m, i, M))
+    res <- run_experiment(model, m)
+    all_results <- rbind(all_results, res)
+  }
+  
+  # 각 x값에 대한 평균 coverage 계산
+  coverage_summary <- aggregate(cbind(covered,width) ~ x, data = all_results, mean)
+  return(coverage_summary)
+}
+
+# 모델 및 샘플 크기에 대해 Monte Carlo 실행
+models <- 1:4
+sample_sizes <- c(50, 100, 200)
+monte_carlo_results <- list()
+
+for (model in models) {
+  for (m in sample_sizes) {
+    coverage_res <- run_monte_carlo(model, m, M=500)
+    monte_carlo_results <- append(monte_carlo_results, list(list(model=model, m=m, coverage=coverage_res)))
+  }
+}
