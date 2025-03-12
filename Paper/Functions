@@ -35,17 +35,16 @@ compute_norm <- function(vector) {
 # 3. Prop 3.1 내의 확률부분을 계산하는 함수 
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    ncp_value <- min(t^2, 10^2)
-    safe_qchisq <- qchisq(P, df = 1, ncp = ncp_value)
-    if (k <= 1e-6) return(1e-6)
+    ncp_value <- min(t^2, 10^2) # 비중심 모수 값이 너무 커지지 않도록 제한
+    safe_qchisq <- qchisq(P, df = 1, ncp = ncp_value) 
     threshold <- (nu * safe_qchisq) / (k^2)
-    if (threshold > 10^2) return(1e-6)
     probability <- pchisq(threshold, df = nu, lower.tail = FALSE)
-    if (is.na(probability) || is.nan(probability) || is.infinite(probability)) return(1e-6)
+    # 결측치 처리
+    if (is.na(probability) || is.nan(probability)) return(1e-6)
     return(probability)
   }, error = function(e) {
     warning("compute_probability 계산 오류 발생, 근사값 사용")
-    #return(1e-6)
+    #return(1e-6) 근사값을 따로 출력하지 않도록 설정
   })
 }
 
@@ -63,14 +62,13 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
       integrate(integrand, lower = 0, upper = 100, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
     }, error = function(e) {
       warning("적분 실패")
-      #return(1e-6)
+      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
     })
-    
     pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-    return(abs((pi_term * integral_result) - gamma))
+    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
   }
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 5))$minimum)
+    return(optimize(obj_func, interval = c(0.01, 5))$minimum) # 범위는 0부터 5까지로 설정
   }, error = function(e) {
     warning("find_k_factor 계산 실패: 근사값 사용")
     #return(1) #근사값은 오차항이 정규분포를 따른다는 가정에서만 사용 가능하므로, 근사값은 사용하지 않기로 결정.
@@ -87,12 +85,13 @@ transform_function <- function(models, sample_sizes, M, seed) {
     for (m in sample_sizes) {
       transformed_data <- matrix(NA, nrow = m, ncol = M)
       raw_data <- vector("list", M)
-      
+
+      # 데이터의 분산을 추정해 추정된 분산으로 데이터를 나누어 transform
       for (i in 1:M) {
         data <- generate_data(model, m)
         x <- data$x
         y <- data$y
-        fit <- smooth.spline(x = x, y = y, cv = FALSE)
+        fit <- smooth.spline(x = x, y = y, cv = FALSE) #논문 방법과 동일하게 GCV 사용
         pred_y <- predict(fit, x)$y
         residuals <- y - pred_y
         
