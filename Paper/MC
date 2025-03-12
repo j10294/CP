@@ -79,8 +79,8 @@ for (model in models) {
       
       k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu=nu, norm_lx_h = nlh))
       
-      TI_upper <- pred_y + estimated_variance * k_factors
-      TI_lower <- pred_y - estimated_variance * k_factors
+      TI_upper <- pred_y + sqrt(estimated_variance) * k_factors
+      TI_lower <- pred_y - sqrt(estimated_variance) * k_factors
       
       TI_upper <- TI_upper * sqrt(variance_hat)
       TI_lower <- TI_lower * sqrt(variance_hat)
