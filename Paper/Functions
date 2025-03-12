@@ -35,7 +35,7 @@ compute_norm <- function(vector) {
 # 3. Prop 3.1 내의 확률부분을 계산하는 함수 
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    ncp_value <- min(t^2, 10^2) # 비중심 모수 값이 너무 커지지 않도록 제한
+    ncp_value <- min(t^2, 20) # 비중심 모수 값이 너무 커지지 않도록 20으로 제한
     safe_qchisq <- qchisq(P, df = 1, ncp = ncp_value) 
     threshold <- (nu * safe_qchisq) / (k^2)
     probability <- pchisq(threshold, df = nu, lower.tail = FALSE)
