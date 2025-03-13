@@ -1,5 +1,6 @@
 library(ggplot2)
 library(gridExtra)
+library(grid)
 
 # 플로팅 함수
 plot_model_results <- function(monte_carlo_results, model_num) {
