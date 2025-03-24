@@ -1,0 +1,207 @@
+# Required Libraries
+library(dplyr)
+library(splines)
+library(ggplot2)
+
+# 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  x <- seq(0, 10, length.out = n)
+  if (model == 1) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  }
+  return(data.frame(x = x, y = y))
+}
+
+# Function to Compute Empirical Risk
+compute_empirical_risk <- function(model, data, labels, loss_function) {
+  predictions <- predict(model, data)
+  return(mean(loss_function(labels, predictions)))
+}
+
+# Hoeffding's Simple Upper Confidence Bound
+hoeffding_ucb <- function(n, R_hat, delta) {
+  return(R_hat + sqrt(log(1/delta) / (2 * n)))
+}
+
+# Hoeffding's Inequality Bound Implementation
+hoeffding_bound <- function(n, t, R) {
+  h1 <- t * log(t / R) + (1 - t) * log((1 - t) / (1 - R))
+  return(exp(-n * h1))
+}
+
+# Bentkus Inequality Bound Implementation
+bentkus_bound <- function(n, t, R) {
+  p_value <- pbinom(floor(n * t), size = n, prob = R)
+  return(exp(1) * p_value)
+}
+
+# Hoeffding-Bentkus Lower Tail Probability Bound
+g_HB <- function(n, t, R) {
+  return(pmin(hoeffding_bound(n, t, R), bentkus_bound(n, t, R)))
+}
+
+# Upper Confidence Bound Calculation using Hoeffding-Bentkus
+generate_upper_confidence_bound <- function(n, R_hat, delta) {
+  possible_R <- seq(0, 1, length.out = 1000)  # Fine grid search
+  valid_R <- possible_R[g_HB(n, R_hat, possible_R) >= delta]
+  
+  if (length(valid_R) == 0) {
+    return(NA)  # No valid upper bound found
+  } else {
+    return(max(valid_R))
+  }
+}
+
+# Function to Apply Model and Compute Bounds
+apply_model_and_compute_bounds <- function(model, data, labels, loss_function, delta) {
+  n <- nrow(data)
+  R_hat <- compute_empirical_risk(model, data, labels, loss_function)
+  R_hoef <- hoeffding_ucb(n, R_hat, delta)
+  R_HB <- generate_upper_confidence_bound(n, R_hat, delta)
+  
+  return(list(
+    empirical_risk = R_hat,
+    hoeffding_upper_bound = R_hoef,
+    hoeffding_bentkus_upper_bound = R_HB
+  ))
+}
+
+# Function to Compute Lambda Hat using Hoeffding-Bentkus Bound
+find_lambda_hat_HB <- function(alpha, delta, y, mean_pred, variance, n, lower=0, upper=5) {
+  f <- function(lambda, alpha, delta, y, mean_pred, variance, n) {
+    risk <- mean(y <= mean_pred - sqrt(variance) * lambda |
+                   y >= mean_pred + sqrt(variance) * lambda, na.rm=TRUE)
+    threshold <- (1 - alpha) - g_HB(n, risk, alpha) #Bentkus-Hoeffding bound
+    return(risk - threshold)
+  }
+  
+  lambda_hat <- tryCatch({
+    uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta, 
+            y=y, mean_pred=mean_pred, variance=variance, n=n)$root
+  }, error=function(e){
+    optimize_lambda <- function(lambda) f(lambda, alpha, delta, y, mean_pred, variance, n)
+    optimize(optimize_lambda, interval=c(lower, upper))$minimum
+  })
+  return(lambda_hat)
+}
+
+# Example Monte Carlo Simulation
+run_experiment <- function(model, m) {
+  data <- generate_data(model, m)
+  train_ratio <- 0.5
+  n <- floor(train_ratio * m)
+  train_index <- sample(seq_len(m), size=n)
+  
+  train_data <- data[train_index,]
+  test_data <- data[-train_index,]
+  
+  spline_model_mean <- smooth.spline(train_data$x, train_data$y)
+  train_y_pred <- predict(spline_model_mean, train_data$x)$y
+  train_residuals <- train_data$y - train_y_pred
+  
+  test_y_pred <- predict(spline_model_mean, test_data$x)$y
+  loess_variance_model <- loess((train_residuals)^2 ~ train_data$x, span=0.5)
+  test_variance_pred <- predict(loess_variance_model, newdata=data.frame(train_x = test_data$x))
+  
+  alpha <- 0.95
+  delta <- 0.90
+  lambda_hat <- find_lambda_hat_HB(alpha, delta, test_data$y, test_y_pred, test_variance_pred, length(test_data$y))
+  
+  upper <- test_y_pred + lambda_hat * sqrt(test_variance_pred)
+  lower <- test_y_pred - lambda_hat * sqrt(test_variance_pred)
+  width <- 2 * lambda_hat * sqrt(test_variance_pred)
+  
+  coverage_per_x <- data.frame(x=test_data$x, covered=(test_data$y >= lower & test_data$y <= upper), width=width)
+  return(coverage_per_x)
+}
+
+run_monte_carlo <- function(model, m, M=500) {
+  all_results <- data.frame()
+  
+  for (i in 1:M) {
+    cat(sprintf("Model %d, m=%d, Iteration %d/%d\n", model, m, i, M))
+    res <- run_experiment(model, m)
+    all_results <- rbind(all_results, res)
+  }
+  
+  coverage_summary <- aggregate(cbind(covered, width) ~ x, data=all_results, mean)
+  return(coverage_summary)
+}
+
+# 플로팅 함수
+plot_model_results <- function(monte_carlo_results, model_num) {
+  plot_list <- list()
+  
+  # 특정 모델의 결과만 필터링
+  model_results <- Filter(function(res) res$model == model_num, monte_carlo_results)
+  
+  if (length(model_results) == 0) {
+    cat(sprintf("No results found for Model %d\n", model_num))
+    return(NULL)
+  }
+  
+  for (res in model_results) {
+    coverage_data <- res$coverage
+    
+    if (nrow(coverage_data) == 0) {
+      next  # 데이터가 비어있으면 건너뛰기
+    }
+    
+    # 1️⃣ Pointwise Coverage Plot
+    p1 <- ggplot(coverage_data, aes(x = x, y = covered)) +
+      geom_point(color = 'red', size=0.5) +
+      geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'black') +
+      labs(title = paste("Pointwise Coverage (Model", model_num, ")"),
+           x = "x", y = "Coverage Probability") +
+      ylim(0, 1) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+    
+    # 2️⃣ Interval Width Plot
+    p2 <- ggplot(coverage_data, aes(x = x, y = width)) +
+      geom_point(size = 0.5, na.rm = TRUE, color = 'blue') +
+      labs(title = paste("Interval Width (Model", model_num, ")"),
+           x = "x", y = "Interval Width") +
+      theme_minimal() +
+      ylim(0,30)+
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+    
+    plot_list <- append(plot_list, list(p1, p2))
+  }
+  
+  if (length(plot_list) == 0) {
+    cat(sprintf("No valid data to plot for Model %d\n", model_num))
+    return(NULL)
+  }
+  
+  model_title <- textGrob(paste("Model", model_num), gp = gpar(fontsize = 13, fontface = "bold"))
+  grid.arrange(model_title, do.call(arrangeGrob, c(plot_list, ncol = 2)),
+               ncol = 1, heights = c(0.2, 5))
+}
+
+sample_sizes <- c(50, 100, 200)
+model_num <- 1:4
+monte_carlo_results <- list()
+
+for (model in model_num){
+  for (m in sample_sizes){
+    cat(sprintf('Running Model %d with Sample size %d\n', model, m))
+    res <- run_monte_carlo(model, m, M=500)
+    monte_carlo_results <- append(monte_carlo_results, list(list(model=model,m=m, coverage=res)))
+  }
+}
+
+# Example of Plotting
+plot_model_results(monte_carlo_results, model_num=1)
+plot_model_results(monte_carlo_results, model_num=2)
+plot_model_results(monte_carlo_results, model_num=3)
+plot_model_results(monte_carlo_results, model_num=4)
