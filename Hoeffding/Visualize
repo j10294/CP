@@ -1,0 +1,41 @@
+# Function to Plot Results
+plot_model_results <- function(monte_carlo_results, model_num) {
+  plot_list <- list()
+
+  model_results <- Filter(function(res) res$model == model_num, monte_carlo_results)
+  
+  for (res in model_results) {
+    coverage_data <- res$coverage
+
+    if (nrow(coverage_data) == 0) {
+      next
+    }
+
+    p1 <- ggplot(coverage_data, aes(x = x, y = covered)) +
+      geom_point(color = 'red') +
+      geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'black') +
+      labs(title = paste("Pointwise Coverage (Model", model_num, ")"),
+           x = "x", y = "Coverage Probability") +
+      ylim(0, 1) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+
+    p2 <- ggplot(coverage_data, aes(x = x, y = width)) +
+      geom_point(size = 0.5, na.rm = TRUE, color = 'blue') +
+      labs(title = paste("Interval Width (Model", model_num, ")"),
+           x = "x", y = "Interval Width") +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
+
+    plot_list <- append(plot_list, list(p1, p2))
+  }
+
+  if (length(plot_list) == 0) {
+    cat(sprintf("No valid data to plot for Model %d\n", model_num))
+    return(NULL)
+  }
+
+  model_title <- textGrob(paste("Model", model_num), gp = gpar(fontsize = 13, fontface = "bold"))
+  grid.arrange(model_title, do.call(arrangeGrob, c(plot_list, ncol = 2)),
+               ncol = 1, heights = c(0.2, 5))
+}
