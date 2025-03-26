@@ -93,15 +93,18 @@ run_monte_carlo <- function(model, m, M=500){
   all_results <- data.frame()
   
   for (i in 1:M) {
-    cat(sprintf("Model %d, m=%d, Iteration %d/%d\n", model, m, i, M))
+    if (i %% 50 == 0) {
+      cat(sprintf("Model %d, m=%d, Iteration %d/%d\n", model, m, i, M))
+    }
     res <- run_experiment(model, m)
     all_results <- rbind(all_results, res)
   }
   
   # 각 x값에 대한 평균 coverage 계산
-  coverage_summary <- aggregate(cbind(covered,width) ~ x, data = all_results, mean)
+  coverage_summary <- aggregate(cbind(covered, width) ~ x, data = all_results, mean)
   return(coverage_summary)
 }
+
 
 # 모델 및 샘플 크기에 대해 Monte Carlo 실행
 models <- 1:4
