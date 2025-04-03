@@ -26,106 +26,10 @@ target_vars <- setdiff(numeric_vars, c("AGE", exclude_vars))
 alpha <- 0.95
 delta <- 0.90
 
-
-# 결과 저장할 데이터프레임 초기화
 summary_results <- data.frame()
 
-# 반복 횟수
-for (seed in 1:50) {
-  cat("Running seed:", seed, "\n")
-  
-  set.seed(seed)
-  
-  run_results <- lapply(seq_along(target_vars), function(i) {
-    y_var <- target_vars[i]
-    x <- data$AGE
-    y <- data[[y_var]]
-    
-    m <- nrow(data)
-    n_train <- 100
-    n_cal <- 100
-    n_test <- m - n_train - n_cal
-    
-    all_indices <- sample(seq_len(m))
-    train_index <- all_indices[1:n_train]
-    cal_index <- all_indices[(n_train + 1):(n_train + n_cal)]
-    test_index <- all_indices[(n_train + n_cal + 1):m]
-    
-    train_x <- x[train_index]
-    train_y <- y[train_index]
-    cal_x <- x[cal_index]
-    cal_y <- y[cal_index]
-    test_x <- x[test_index]
-    test_y <- y[test_index]
-    
-    fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
-    cal_mean_pred <- predict(fit, cal_x)$y
-    train_res <- train_y - predict(fit, train_x)$y
-    loess_model <- loess((train_res^2) ~ train_x, span = 0.5)
-    cal_variance <- predict(loess_model, newdata = data.frame(train_x = cal_x))
-    cal_variance[is.na(cal_variance) | cal_variance <= 0] <- 1e-6
-    
-    lambda_hat <- find_lambda_hat(alpha, delta, cal_y, cal_mean_pred, cal_variance, length(cal_y))
-    
-    test_mean_pred <- predict(fit, test_x)$y
-    test_variance <- predict(loess_model, newdata = data.frame(train_x = test_x))
-    test_variance[is.na(test_variance) | test_variance <= 0] <- 1e-6
-    
-    TI_upper <- test_mean_pred + sqrt(test_variance) * lambda_hat
-    TI_lower <- test_mean_pred - sqrt(test_variance) * lambda_hat
-    
-    coverage <- (test_y >= TI_lower) & (test_y <= TI_upper)
-    width <- TI_upper - TI_lower
-    MPIW <- mean(width, na.rm=TRUE)
-    PICP <- mean(coverage, na.rm=TRUE)
-    NMPIW <- MPIW / (max(cal_y, na.rm=TRUE) - min(cal_y, na.rm=TRUE))
-    
-    eta <- 50
-    CWC <- if (PICP < alpha) {
-      NMPIW + eta * exp(-eta * (PICP - alpha))
-    } else {
-      NMPIW
-    }
-    
-    test_df <- data.frame(
-      x = test_x,
-      y = test_y,
-      mean = test_mean_pred,
-      lower = TI_lower,
-      upper = TI_upper,
-      covered = coverage
-    )
-    
-    p <- ggplot(test_df, aes(x = x)) +
-      geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightgreen", alpha = 0.4) +
-      geom_line(aes(y = mean), color = "green") +
-      geom_point(aes(y = y, color = covered), size = 1) +
-      scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
-      labs(title = paste("TI for", y_var),
-           subtitle = sprintf("PICP=%.3f, NMPIW=%.3f, CWC=%.3f", PICP, NMPIW, CWC),
-           y = y_var) +
-      theme_minimal()
-    
-    # 그림 저장
-    ggsave(filename = sprintf("TI_%s_seed%02d.png", y_var, seed),
-           plot = p, width = 6, height = 4)
-    
-    # 요약 테이블에 저장
-    return(data.frame(seed = seed, var = y_var, PICP = PICP, NMPIW = NMPIW, CWC = CWC))
-  })
-  
-  summary_results <- rbind(summary_results, do.call(rbind, run_results))
-}
-
-# 전체 결과 저장
-write.csv(summary_results, "hoeffding_summary_results.csv", row.names = FALSE)
-
-library(ggpubr)
-
-# 반복
 for (s in 1:50) {
   cat("Saving plots for seed", s, "\n")
-  
   set.seed(s)
   
   run_results <- lapply(seq_along(target_vars), function(i) {
@@ -174,7 +78,7 @@ for (s in 1:50) {
     
     eta <- 50
     CWC <- if (PICP < alpha) {
-      NMPIW + eta * exp(-eta * (PICP - alpha))
+      NMPIW * (1 + exp(-eta * (PICP - alpha)))
     } else {
       NMPIW
     }
@@ -198,35 +102,33 @@ for (s in 1:50) {
            y = y_var) +
       theme_minimal()
     
-    # 그림 저장
-    ggsave(filename = sprintf("TI_%s_seed%02d.png", y_var, seed),
-           plot = p, width = 6, height = 4)
-    
-  return(list(var = y_var, PICP = PICP, NMPIW = NMPIW, CWC = CWC, plot = p))
+    return(list(
+      summary = data.frame(seed = s, var = y_var, PICP = PICP, NMPIW = NMPIW, CWC = CWC),
+      plot = p
+    ))
   })
   
-  # 9개 plot 추출
-  plot_list <- lapply(run_results, function(res) res$plot)
+  summary_results <- rbind(summary_results, do.call(rbind, lapply(run_results, `[[`, "summary")))
   
-  # 3x3 grid로 저장
+  plot_list <- lapply(run_results[1:min(9, length(run_results))], `[[`, "plot")
   g <- ggarrange(plotlist = plot_list, ncol = 3, nrow = 3)
-  ggsave(filename = sprintf("TI_plots_seed%02d.png", s), plot = g, width = 12, height = 9, bg='white')
+  ggsave(filename = sprintf("TI_plots_seed%02d.png", s), plot = g, width = 12, height = 9, bg = 'white')
 }
 
 library(dplyr)
 
+summary_results %>% group_by(var)
 summary_table <- summary_results %>%
   group_by(var) %>%
   summarise(
     mean_PICP = mean(PICP, na.rm = TRUE),
     mean_NMPIW = mean(NMPIW, na.rm = TRUE),
     mean_CWC = mean(CWC, na.rm = TRUE)
-  ) %>%
-  arrange(desc(mean_PICP))  # PICP 높은 순으로 정렬 (선택사항)
+  ) #%>%
+  #arrange(desc(mean_PICP))  # PICP 높은 순으로 정렬 (선택사항)
 
 # 보기 좋게 출력
 print(summary_table)
 
 # CSV 저장
-#write.csv(summary_table, "hoeffding_summary_table_by_var.csv", row.names = FALSE)
-
+write.csv(summary_table, "hoeffding_summary_table_by_var.csv", row.names = FALSE)
