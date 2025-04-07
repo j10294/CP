@@ -1,19 +1,20 @@
+# hoeffding 방법에서도 선형 보간을 이용해야 함. test data 는 마지막까지 보지 않아야 함.
 library(ggplot2)
 library(gridExtra)
 library(ggpubr)
 
-find_lambda_hat <- function(alpha, delta, y, mean_pred, variance, n, lower=0, upper=5){
-  f <- function(lambda, alpha, delta, y, mean_pred, variance, n){
-    risk <- mean(y <= mean_pred - sqrt(variance)*lambda |
-                   y >= mean_pred + sqrt(variance)*lambda, na.rm=TRUE)
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
+  f <- function(lambda, alpha, delta, y, pred, variance, n){
+    risk <- mean(y <= pred - sqrt(variance)*lambda |
+                   y >= pred + sqrt(variance)*lambda, na.rm=TRUE)
     threshold <- (1 - alpha) - sqrt(log(1/delta) / (2*n))
     return(risk - threshold)
   }
   lambda_hat <- tryCatch({
     uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta,
-            y=y, mean_pred=mean_pred, variance=variance, n=n)$root
+            y=y, pred=pred, variance=variance, n=n)$root
   }, error=function(e){
-    optimize(function(lambda) f(lambda, alpha, delta, y, mean_pred, variance, n),
+    optimize(function(lambda) f(lambda, alpha, delta, y, pred, variance, n),
              interval = c(lower, upper))$minimum
   })
   return(lambda_hat)
@@ -26,8 +27,8 @@ target_vars <- setdiff(numeric_vars, c("AGE", exclude_vars))
 alpha <- 0.95
 delta <- 0.90
 
-summary_results <- data.frame()
-
+# 결과를 저장할 리스트
+all_results <- list()
 for (s in 1:50) {
   cat("Saving plots for seed", s, "\n")
   set.seed(s)
@@ -42,6 +43,7 @@ for (s in 1:50) {
     n_cal <- 100
     n_test <- m - n_train - n_cal
     
+    # 데이터 샘플링
     all_indices <- sample(seq_len(m))
     train_index <- all_indices[1:n_train]
     cal_index <- all_indices[(n_train + 1):(n_train + n_cal)]
@@ -54,81 +56,69 @@ for (s in 1:50) {
     test_x <- x[test_index]
     test_y <- y[test_index]
     
+    # 1. 훈련 데이터를 이용해 모델 학습 (평균 예측값 계산)
     fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
-    cal_mean_pred <- predict(fit, cal_x)$y
+    cal_mean_pred <- predict(fit, cal_x)$y  # mean prediction
+    
+    # 2. Calibration 데이터로 예측 오차의 분산 추정 (log scale로)
     train_res <- train_y - predict(fit, train_x)$y
-    loess_model <- loess((train_res^2) ~ train_x, span = 0.5)
-    cal_variance <- predict(loess_model, newdata = data.frame(train_x = cal_x))
-    cal_variance[is.na(cal_variance) | cal_variance <= 0] <- 1e-6
+    log_res2 <- log(train_res^2 + 1e-8)
+    gam_model <- gam(log_res2 ~ s(train_x))
+    log_pred <- predict(gam_model, newdata = data.frame(train_x = cal_x))
+    cal_variance <- exp(log_pred) # 분산 추정값
     
-    lambda_hat <- find_lambda_hat(alpha, delta, cal_y, cal_mean_pred, cal_variance, length(cal_y))
+    # 3. Tolerance Interval 계산 (분산을 포함한 계산)
+    # 예시로 lambda_hat는 보통 특정 확률값을 기준으로 계산
+    lambda_hat <- find_lambda_hat(alpha,delta , cal_y, cal_mean_pred, cal_variance, length(cal_y))
     
-    test_mean_pred <- predict(fit, test_x)$y
-    test_variance <- predict(loess_model, newdata = data.frame(train_x = test_x))
-    test_variance[is.na(test_variance) | test_variance <= 0] <- 1e-6
+    TI_upper <- cal_mean_pred + sqrt(cal_variance) * lambda_hat
+    TI_lower <- cal_mean_pred - sqrt(cal_variance) * lambda_hat
     
-    TI_upper <- test_mean_pred + sqrt(test_variance) * lambda_hat
-    TI_lower <- test_mean_pred - sqrt(test_variance) * lambda_hat
+    # 4. 선형 보간을 이용해 test 데이터가 TI 구간에 포함되는지 계산 (PICP 계산)
+    TI_lower_df <- aggregate(TI_lower ~ cal_x, FUN = mean)
+    TI_upper_df <- aggregate(TI_upper ~ cal_x, FUN = mean)
     
-    coverage <- (test_y >= TI_lower) & (test_y <= TI_upper)
-    width <- TI_upper - TI_lower
-    MPIW <- mean(width, na.rm=TRUE)
-    PICP <- mean(coverage, na.rm=TRUE)
-    NMPIW <- MPIW / (max(cal_y, na.rm=TRUE) - min(cal_y, na.rm=TRUE))
+    # 선형 보간
+    interp_lower <- approx(x = TI_lower_df$cal_x, y = TI_lower_df$TI_lower, xout = test_x)$y
+    interp_upper <- approx(x = TI_upper_df$cal_x, y = TI_upper_df$TI_upper, xout = test_x)$y
     
-    eta <- 50
-    CWC <- if (PICP < alpha) {
-      NMPIW * (1 + exp(-eta * (PICP - alpha)))
-    } else {
-      NMPIW
-    }
+    # test_x에 대해 예측값이 TI 구간에 포함되었는지 여부 확인
+    included <- (test_y >= interp_lower) & (test_y <= interp_upper)
+    PICP <- mean(included, na.rm = TRUE)  # 포함된 비율
     
-    test_df <- data.frame(
-      x = test_x,
-      y = test_y,
-      mean = test_mean_pred,
-      lower = TI_lower,
-      upper = TI_upper,
-      covered = coverage
-    )
+    # NMPIW 계산
+    interval_width <- interp_upper - interp_lower
+    y_range <- max(test_y) - min(test_y)
+    NMPIW <- mean(interval_width, na.rm = TRUE) / y_range
     
-    p <- ggplot(test_df, aes(x = x)) +
-      geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightgreen", alpha = 0.4) +
-      geom_line(aes(y = mean), color = "green") +
-      geom_point(aes(y = y, color = covered), size = 1) +
-      scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
-      labs(title = paste("TI for", y_var),
-           subtitle = sprintf("PICP=%.3f, NMPIW=%.3f, CWC=%.3f", PICP, NMPIW, CWC),
-           y = y_var) +
-      theme_minimal()
-    
-    return(list(
-      summary = data.frame(seed = s, var = y_var, PICP = PICP, NMPIW = NMPIW, CWC = CWC),
-      plot = p
+    # 결과를 반환 (일관된 구조로 반환)
+    return(data.frame(
+      Variable = y_var,
+      Seed = s,
+      PICP = PICP,
+      NMPIW = NMPIW
     ))
   })
   
-  summary_results <- rbind(summary_results, do.call(rbind, lapply(run_results, `[[`, "summary")))
-  
-  plot_list <- lapply(run_results[1:min(9, length(run_results))], `[[`, "plot")
-  g <- ggarrange(plotlist = plot_list, ncol = 3, nrow = 3)
-  ggsave(filename = sprintf("TI_plots_seed%02d.png", s), plot = g, width = 12, height = 9, bg = 'white')
+  # run_results 리스트에서 각 시드에 대한 결과를 all_results에 저장
+  all_results <- append(all_results, run_results)
 }
 
+# all_results를 데이터 프레임으로 변환하여 보기 좋게 저장
+final_results_df <- do.call(rbind, all_results)
+
+# 결과 출력
+print(final_results_df)
+
+# 각 변수별로 평균 PICP와 NMPIW 계산
 library(dplyr)
-
-summary_results %>% group_by(var)
-summary_table <- summary_results %>%
-  group_by(var) %>%
+mean_results_df <- final_results_df %>%
+  group_by(Variable) %>%
   summarise(
-    mean_PICP = mean(PICP, na.rm = TRUE),
-    mean_NMPIW = mean(NMPIW, na.rm = TRUE),
-    mean_CWC = mean(CWC, na.rm = TRUE)
-  ) #%>%
-  #arrange(desc(mean_PICP))  # PICP 높은 순으로 정렬 (선택사항)
+    Mean_PICP = mean(PICP, na.rm = TRUE),
+    Mean_NMPIW = mean(NMPIW, na.rm = TRUE)
+  )
 
-# 보기 좋게 출력
-print(summary_table)
+# 평균값 출력
+print(mean_results_df)
 
-# CSV 저장
-write.csv(summary_table, "hoeffding_summary_table_by_var.csv", row.names = FALSE)
