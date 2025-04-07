@@ -38,92 +38,99 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
 run_simulation <- function(y_var, seed, data) {
   set.seed(seed)
   
-  x <- data$AGE
-  y <- data[[y_var]]
+  result <- tryCatch({
   
-  m <- length(y)
-  n_test <- 115
-  n_train <- m - n_test
+    x <- data$AGE
+    y <- data[[y_var]]
+    
+    m <- length(y)
+    n_test <- 115
+    n_train <- m - n_test
+    
+    idx <- sample(seq_len(m))
+    train_idx <- idx[1:n_train]
+    test_idx <- idx[(n_train+1):m]
+    
+    train_x <- x[train_idx]
+    raw_train_y <- y[train_idx]
+    test_x <- x[test_idx]
+    raw_test_y <- y[test_idx]
+    
+    raw_fit <- smooth.spline(train_x, raw_train_y, cv=FALSE)
+    raw_pred_y <- predict(raw_fit, train_x)$y
+    raw_residuals <- raw_train_y - raw_pred_y
+    
+    variance_fit <- gam(raw_residuals^2 ~ s(train_x))
+    var_list <- predict(variance_fit, newdata = data.frame(train_x = x))
+    
+    transform_y <- y / sqrt(var_list)
+    train_y <- transform_y[train_idx]
+    test_y <- transform_y[test_idx]
+    
+    fit <- smooth.spline(train_x, train_y, cv=FALSE)
+    residuals <- predict(fit, train_x)$y - train_y
+    
+    B <- bs(train_x, df=max(fit$df, 3))
+    D <- diff(diag(ncol(B)), differences=2)
+    S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+    smoother_matrix <- B %*% S_inv %*% t(B)
+    I_n <- diag(length(train_x))
+    residual_matrix <- I_n - smoother_matrix
+    
+    estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
+    
+    compute_norm <- function(v) sqrt(sum(v^2))
+    norm_lx_h_values <- apply(smoother_matrix, 1, compute_norm)
+    
+    numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+    denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+    nu <- numerator / denominator
+    
+    k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu, nlh))
+    
+    pred_y <- predict(fit, train_x)$y
+    TI_upper <- pred_y + k_factors * sqrt(estimated_variance)
+    TI_lower <- pred_y - k_factors * sqrt(estimated_variance)
+    
+    # 원래 y로 변환
+    raw_TI_upper <- TI_upper * sqrt(var_list[train_idx])
+    raw_TI_lower <- TI_lower * sqrt(var_list[train_idx])
+    pred_raw_y <- pred_y * sqrt(var_list[train_idx])
+    
+    # test_x 보간
+    TI_lower_df <- aggregate(raw_TI_lower ~ train_x, FUN = mean)
+    TI_upper_df <- aggregate(raw_TI_upper ~ train_x, FUN = mean)
+    
+    interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$raw_TI_lower, xout = test_x)$y
+    interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$raw_TI_upper, xout = test_x)$y
+    
+    included <- (raw_test_y >= interp_lower) & (raw_test_y <= interp_upper)
+    PICP <- mean(included, na.rm=TRUE)
+    NMPIW <- mean(interp_upper - interp_lower, na.rm=TRUE) /(max(raw_test_y)-min(raw_test_y))
+    
+    return(list(
+      train_x = train_x,
+      pred_y = pred_raw_y,
+      raw_TI_lower = raw_TI_lower,
+      raw_TI_upper = raw_TI_upper,
+      test_x = test_x,
+      raw_test_y = raw_test_y,
+      PICP = PICP,
+      NMPIW = NMPIW
+    ))
+  }, error = function(e){
+    # 에러 발생 시, NULL을 반환하고 계속 진행
+    message("Error in simulation for variable: ", y_var, ", seed: ", seed, " - Skipping.")
+    return(NULL)
+  })
   
-  idx <- sample(seq_len(m))
-  train_idx <- idx[1:n_train]
-  test_idx <- idx[(n_train+1):m]
-  
-  train_x <- x[train_idx]
-  raw_train_y <- y[train_idx]
-  test_x <- x[test_idx]
-  raw_test_y <- y[test_idx]
-  
-  raw_fit <- smooth.spline(train_x, raw_train_y, cv=FALSE)
-  raw_pred_y <- predict(raw_fit, train_x)$y
-  raw_residuals <- raw_train_y - raw_pred_y
-  
-  variance_fit <- gam(raw_residuals^2 ~ s(train_x))
-  var_list <- predict(variance_fit, newdata = data.frame(train_x = x))
-  
-  transform_y <- y / sqrt(var_list)
-  train_y <- transform_y[train_idx]
-  test_y <- transform_y[test_idx]
-  
-  fit <- smooth.spline(train_x, train_y, cv=FALSE)
-  residuals <- predict(fit, train_x)$y - train_y
-  
-  B <- bs(train_x, df=max(fit$df, 3))
-  D <- diff(diag(ncol(B)), differences=2)
-  S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
-  smoother_matrix <- B %*% S_inv %*% t(B)
-  I_n <- diag(length(train_x))
-  residual_matrix <- I_n - smoother_matrix
-  
-  estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
-  
-  compute_norm <- function(v) sqrt(sum(v^2))
-  norm_lx_h_values <- apply(smoother_matrix, 1, compute_norm)
-  
-  numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
-  denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
-  nu <- numerator / denominator
-  
-  k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu, nlh))
-  
-  pred_y <- predict(fit, train_x)$y
-  TI_upper <- pred_y + k_factors * sqrt(estimated_variance)
-  TI_lower <- pred_y - k_factors * sqrt(estimated_variance)
-  
-  # 원래 y로 변환
-  raw_TI_upper <- TI_upper * sqrt(var_list[train_idx])
-  raw_TI_lower <- TI_lower * sqrt(var_list[train_idx])
-  pred_raw_y <- pred_y * sqrt(var_list[train_idx])
-  
-  # test_x 보간
-  TI_lower_df <- aggregate(raw_TI_lower ~ train_x, FUN = mean)
-  TI_upper_df <- aggregate(raw_TI_upper ~ train_x, FUN = mean)
-  
-  interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$raw_TI_lower, xout = test_x)$y
-  interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$raw_TI_upper, xout = test_x)$y
-  
-  included <- (raw_test_y >= interp_lower) & (raw_test_y <= interp_upper)
-  PICP <- mean(included, na.rm=TRUE)
-  NMPIW <- mean(interp_upper - interp_lower) / (max(raw_test_y) - min(raw_test_y))
-  
-  return(list(
-    train_x = train_x,
-    pred_y = pred_raw_y,
-    raw_TI_lower = raw_TI_lower,
-    raw_TI_upper = raw_TI_upper,
-    test_x = test_x,
-    raw_test_y = raw_test_y,
-    PICP = PICP,
-    NMPIW = NMPIW
-  ))
+  if (is.null(result)) return(NULL)
+
+  return(result)
 }
 
 
 # 2.  반복 실행 및 평균 PICP, NMPIW 계산하는 코드
-# 전제: data, target_vars, run_simulation() 이미 존재한다고 가정
-
-results_list <- list()
-
 for (y_var in target_vars) {
   cat("⏳ 변수:", y_var, "계산 중...\n")
   
@@ -131,15 +138,23 @@ for (y_var in target_vars) {
   nmpiw_vals <- numeric(50)
   
   for (seed in 1:50) {
-    sim_result <- run_simulation(y_var = y_var, seed = seed, data = data)
-    picp_vals[seed] <- sim_result$PICP
-    nmpiw_vals[seed] <- sim_result$NMPIW
+    sim_result <- tryCatch({
+      run_simulation(y_var = y_var, seed = seed, data = data)
+    }, error = function(e) {
+      message("Error in simulation for variable: ", y_var, ", seed: ", seed, " - Skipping.")
+      return(NULL)
+    })
+    
+    if (!is.null(sim_result)) {
+      picp_vals[seed] <- sim_result$PICP
+      nmpiw_vals[seed] <- sim_result$NMPIW
+    }
   }
   
   results_list[[y_var]] <- data.frame(
     Variable = y_var,
-    Mean_PICP = mean(picp_vals),
-    Mean_NMPIW = mean(nmpiw_vals)
+    Mean_PICP = mean(picp_vals, na.rm = TRUE),
+    Mean_NMPIW = mean(nmpiw_vals, na.rm = TRUE)
   )
 }
 
@@ -157,27 +172,41 @@ library(gridExtra)
 # 그림 저장 함수
 save_ti_plot <- function(train_x, pred_y, raw_TI_lower, raw_TI_upper, 
                          test_x, raw_test_y, var_name, seed_num, save_path = ".") {
-  plot_df <- data.frame(
-    x = train_x,
-    pred_y = pred_y,
-    TI_lower = raw_TI_lower,
-    TI_upper = raw_TI_upper
-  )
   
-  test_plot_df <- data.frame(
-    x = test_x,
-    y = raw_test_y
-  )
+  # tryCatch를 추가하여 오류 발생 시에도 계속 진행
+  plot_result <- tryCatch({
+    plot_df <- data.frame(
+      x = train_x,
+      pred_y = pred_y,
+      TI_lower = raw_TI_lower,
+      TI_upper = raw_TI_upper
+    )
+    
+    test_plot_df <- data.frame(
+      x = test_x,
+      y = raw_test_y
+    )
+    
+    p <- ggplot() +
+      geom_ribbon(data = plot_df, aes(x = x, ymin = TI_lower, ymax = TI_upper), fill = "red", alpha = 0.2) +
+      geom_line(data = plot_df, aes(x = x, y = pred_y), color = "blue", size = 1) +
+      geom_point(data = test_plot_df, aes(x = x, y = y), color = "black", alpha = 0.6) +
+      labs(title = paste0(var_name, " (Seed ", seed_num, ")"), x = "AGE", y = var_name) +
+      theme_minimal()
+    
+    return(p)
+  }, error = function(e) {
+    # 에러 발생 시, NULL을 반환하고 계속 진행
+    message("Error in saving plot for variable: ", var_name, ", seed: ", seed_num, " - Skipping.")
+    return(NULL)
+  })
   
-  p <- ggplot() +
-    geom_ribbon(data = plot_df, aes(x = x, ymin = TI_lower, ymax = TI_upper), fill = "red", alpha = 0.2) +
-    geom_line(data = plot_df, aes(x = x, y = pred_y), color = "blue", size = 1) +
-    geom_point(data = test_plot_df, aes(x = x, y = y), color = "black", alpha = 0.6) +
-    labs(title = paste0(var_name, " (Seed ", seed_num, ")"), x = "AGE", y = var_name) +
-    theme_minimal()
+  # 만약 plot이 NULL이면 반환하지 않음
+  if (is.null(plot_result)) return(NULL)
   
-  return(p)
+  return(plot_result)
 }
+
 
 # 3x3 묶음 저장
 for (var_name in target_vars) {
