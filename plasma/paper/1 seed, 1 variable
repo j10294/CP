@@ -1,0 +1,158 @@
+## paper 코드 수정 (단일 변수, 단일 시드에 대해 1번 수행하는 코드)
+
+
+# 1. 데이터 준비
+data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+x <- data$AGE
+y <- data$BETADIET
+
+# 2. 샘플 분할
+set.seed(1)
+m <- length(y)
+n_test <- 115
+n_train <- m - n_test
+
+idx <- sample(seq_len(m))
+train_idx <- idx[1:n_train]
+test_idx <- idx[(n_train+1):m]
+
+train_x <- x[train_idx]
+raw_train_y <- y[train_idx]
+test_x <- x[test_idx]
+raw_test_y <- y[test_idx]
+
+# 3. train data 를 이용해 분산 추정 후 데이터 변환
+
+# 평균 추정
+raw_fit <- smooth.spline(train_x, raw_train_y, cv=FALSE)
+raw_pred_y <- predict(raw_fit, train_x)$y
+raw_residuals <- raw_train_y - raw_pred_y
+
+# 분산 추정
+variance_fit <- gam(raw_residuals^2 ~ s(train_x))
+var_list <- predict(variance_fit,newdata = data.frame(train_x = x)) #315개의 추정된 분산을 가진 벡터
+
+# y값 변화
+transform_y <- y/sqrt(var_list); transform_y #표준편차로 나누어 표준화시킨 데이터
+
+# 새로운 train_y, test_y 정의
+train_y <- transform_y[train_idx]
+test_y <- transform_y[test_idx]
+  
+
+#4. Paper method 이용해서 단일 분산 추정
+fit <- smooth.spline(train_x, train_y, cv=FALSE)
+residuals <- predict(fit, train_x)$y - train_y
+
+B <- bs(train_x, df=max(fit$df),3)
+D <- diff(diag(ncol(B)), differences=2)
+S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+smoother_matrix <- B %*% S_inv %*% t(B)
+I_n <- diag(length(train_x))
+residual_matrix <- I_n - smoother_matrix
+
+estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
+cat('추정된 단일 분산 : ', estimated_variance)
+
+# 5. k factor 계산
+
+#-----------------------------------------------------------# 필요한 함수 ##
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    integral_result <- tryCatch({
+      integrate(integrand, lower = 0, upper =50, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    }, error = function(e) {
+      warning("적분 실패")
+      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
+    })
+    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
+  }
+  tryCatch({
+    return(optimize(obj_func, interval = c(0.01, 10))$minimum) # 범위는 0부터 5까지로 설정
+  }, error = function(e) {
+    warning("find_k_factor 계산 실패: 근사값 사용")
+    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
+  })
+}
+#-----------------------------------------------------------# 필요한 함수 ##
+
+
+norm_lx_h_values <- numeric(length(train_x)) #200개 
+for (j in 1:length(train_x)){
+  x_h <- train_x[j]
+  smoothing_vector <- smoother_matrix[j,]
+  norm_lx_h_values[j] <- compute_norm(smoothing_vector)
+}
+
+numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+nu <- numerator / denominator
+
+k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu=nu, norm_lx_h = nlh)) #계산이 안되서 근사값 정리함.
+
+# 6. TI 계산
+pred_y <- predict(fit,train_x)$y
+TI_upper <- pred_y + k_factors*c(estimated_variance)
+TI_lower <- pred_y - k_factors*c(estimated_variance)
+
+# 7. raw_y 에 대한 TI로 변환
+raw_TI_upper <- TI_upper * sqrt(var_list[train_idx])
+raw_TI_lower <- TI_lower * sqrt(var_list[train_idx])
+train_coverage <- mean(raw_train_y >= raw_TI_lower & raw_train_y <= raw_TI_upper)
+cat('훈련 세트의 커버리지 평균 : ', train_coverage)
+
+# 8. 모집단을 포함하는지 test_x, test_y 넣어서 시각화
+library(ggplot2)
+plot_df <- data.frame(
+  x = train_x,
+  pred_y = predict(fit, train_x)$y * sqrt(var_list[train_idx]),  # 원래 스케일로 예측값 변환
+  TI_lower = raw_TI_lower,
+  TI_upper = raw_TI_upper
+)
+
+test_plot_df <- data.frame(
+  x = test_x,
+  y = raw_test_y
+)
+
+ggplot()+
+  geom_point(data=test_plot_df, aes(x=x, y=y), color='black', alpha=0.7)+
+  geom_line(data=plot_df, aes(x=x, y=pred_y), color='blue', size=1)+
+  geom_line(data=plot_df, aes(x=x, y=TI_upper), color='red', linetype='dashed')+
+  geom_line(data=plot_df, aes(x=x, y=TI_lower), color='red', linetype='dashed')+
+  geom_ribbon(data = plot_df, aes(x = x, ymin = TI_lower, ymax = TI_upper), fill = "red", alpha = 0.2)+
+  labs(title='Test obs with train-based TI')
+
+
+# 9. 선형 보간을 이용해 test 관측값이 TI(train-based)에 얼마나 포함되는지 계산
+# 중복된 x 값에 대해 평균 TI_lower 값을 사용
+TI_lower_df <- aggregate(raw_TI_lower ~ train_x, FUN = mean)
+TI_upper_df <- aggregate(raw_TI_upper ~ train_x, FUN = mean)
+
+# 보간 수행
+interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$raw_TI_lower, xout = test_x)$y
+interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$raw_TI_upper, xout = test_x)$y
+
+# 포함 여부
+included <- (raw_test_y >= interp_lower) & (raw_test_y <= interp_upper)
+
+# 포함 개수 및 비율
+num_included <- sum(included)
+total_test <- length(test_x)
+PICP <- num_included / total_test
+
+#PICP
+cat("✅ 포함된 test 점 개수:", num_included, "\n")
+cat("✅ 전체 test 점 개수:", total_test, "\n")
+cat("✅ 포함 비율 (PICP):", round(PICP * 100, 2), "%\n")
+
+#NMPIW
+interval_width <- interp_upper - interp_lower 
+y_range <- max(raw_test_y) - min(raw_test_y)
+NMPIW <- mean(interval_width) / y_range
+cat("✅ NMPIW (Normalized Mean Prediction Interval Width):", round(NMPIW, 4), "\n")
