@@ -2,7 +2,6 @@
 library(mgcv)
 library(ggplot2)
 library(gridExtra)
-library(akima) #2차원 선형 보간을 위해
 
 
 # 필요한 함수 정의
@@ -25,12 +24,7 @@ find_lambda_hat <- function(alpha=0.95, delta=0.90, y, mean_pred, variance, n, l
 # Load data
 data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
 
-# 데이터 (2d)
-x1 <- scale(data$BETAPLASMA)
-x2 <- scale(data$FAT)
-y <- scale(data$RETPLASMA)
-
-n <- length(y)
+n <- length(data$AGE)
 n_train <- 100
 n_cal <- 100
 n_test <- n- n_train - n_cal #115
@@ -41,6 +35,23 @@ all_indices <- sample(seq_len(n))
 train_idx <- all_indices[1:n_train]
 cal_idx <- all_indices[(n_train+1):(n_train+n_cal)]
 test_idx <- all_indices[(n_train+n_cal+1):n]
+
+# 데이터 (2d) (with scaling)
+# train set만으로 평균과 표준편차 추정
+train_mean_x1 <- mean(data$BETAPLASMA[train_idx])
+train_sd_x1   <- sd(data$BETAPLASMA[train_idx])
+
+train_mean_x2 <- mean(data$FAT[train_idx])
+train_sd_x2   <- sd(data$FAT[train_idx])
+
+train_mean_y <- mean(data$RETPLASMA[train_idx])
+train_sd_y   <- sd(data$RETPLASMA[train_idx])
+
+# train/cal/test 각각 동일 기준으로 scaling
+x1 <- (data$BETAPLASMA - train_mean_x1) / train_sd_x1
+x2 <- (data$FAT - train_mean_x2) / train_sd_x2
+y  <- (data$RETPLASMA - train_mean_y) / train_sd_y
+
 
 train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
 train_y <- y[train_idx]
@@ -63,7 +74,7 @@ log_pred <- predict(gam_model, train_x = cal_x) #cal로 분산 예측
 cal_variance <- exp(log_pred) 
 
 # 3. Tolerance Interval 계산 (분산 포함)
-lambda_hat <- find_lambda_hat(alpha, delta, cal_y, cal_mean_pred, cal_variance, length(cal_y))
+lambda_hat <- find_lambda_hat(alpha=0.95, delta=0.90, cal_y, cal_mean_pred, cal_variance, length(cal_y))
 
 TI_upper <- cal_mean_pred + sqrt(cal_variance) * lambda_hat
 TI_lower <- cal_mean_pred - sqrt(cal_variance) * lambda_hat
