@@ -25,7 +25,6 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
 
 library(gam)
 library(MASS)
-
 data <- read.csv('/Users/hdmt306/Downloads/plasma.csv')
 exclude_vars <- c("SEX", "SMOKSTAT", "VITUSE", "ALCOHOL", "BETADIET", "BETAPLASMA", "RETPLASMA")
 numeric_vars <- names(data)[sapply(data, is.numeric)]
@@ -42,15 +41,15 @@ for (y_var in target_vars) {
   
   for (seed in 1:50) {
     cat('  Seed:', seed, '계산 중 ...\n')
-
+    
     x <- data$AGE
     y <- data$y_var
     
-    set.seed(seed)
-    m <- length(y)
+    m <- 315
     n_test <- 115
     n_train <- m - n_test
     
+    set.seed(seed)
     idx <- sample(seq_len(m))
     train_idx <- idx[1:n_train]
     test_idx <- idx[(n_train+1):m]
@@ -67,16 +66,13 @@ for (y_var in target_vars) {
     raw_pred_y <- predict(raw_fit, train_x)$y
     raw_residuals <- raw_train_y - raw_pred_y
     
-    # 분산 추정
-    variance_fit <- gam(raw_residuals^2 ~ s(train_x))
-    var_list <- predict(variance_fit,newdata = data.frame(train_x = x)) #315개의 추정된 분산을 가진 벡터
+    # 분산 추정 (로그변환 후 추정)
+    log_res2 <- log(raw_residuals^2 + 1e-20)
+    variance_fit <- gam(log_res2 ~ s(train_x))
+    var_list <- exp(predict(variance_fit,newdata = data.frame(train_x = train_x))) #200개의 추정된 분산을 가진 벡터
     
     # y값 변화
-    transform_y <- data[[y_var]] / sqrt(var_list); transform_y # 표준편차로 나누어 표준화시킨 데이터
-    
-    # 새로운 train_y, test_y 정의
-    train_y <- transform_y[train_idx]
-    test_y <- transform_y[test_idx]
+    train_y <- raw_train_y / sqrt(var_list) # 표준편차로 나누어 표준화시킨 데이터
     
     # 4. Paper method 이용해서 단일 분산 추정
     fit <- smooth.spline(train_x, train_y, cv=FALSE)
@@ -114,14 +110,12 @@ for (y_var in target_vars) {
     # 7. raw_y 에 대한 TI로 변환
     raw_TI_upper <- TI_upper * sqrt(var_list[train_idx])
     raw_TI_lower <- TI_lower * sqrt(var_list[train_idx])
-    train_coverage <- mean(raw_train_y >= raw_TI_lower & raw_train_y <= raw_TI_upper)
-    cat('훈련 세트의 커버리지 평균 : ', train_coverage)
     
     # 8. 모집단을 포함하는지 test_x, test_y 넣어서 시각화
     library(ggplot2)
     plot_df <- data.frame(
       x = train_x,
-      pred_y = predict(fit, train_x)$y * sqrt(var_list[train_idx]),  # 원래 스케일로 예측값 변환
+      pred_y = predict(fit, train_x)$y * sqrt(var_list),  # 원래 스케일로 예측값 변환
       TI_lower = raw_TI_lower,
       TI_upper = raw_TI_upper
     )
@@ -225,3 +219,4 @@ mean_results_df <- final_results_df %>%
 
 # 평균값 출력
 print(mean_results_df)
+
