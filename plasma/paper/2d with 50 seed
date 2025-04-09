@@ -1,0 +1,124 @@
+# 필요한 패키지
+library(mgcv)
+library(fields)
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    integral_result <- tryCatch({
+      integrate(integrand, lower = 0, upper =50, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    }, error = function(e) {
+      warning("적분 실패")
+      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
+    })
+    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
+  }
+  tryCatch({
+    return(optimize(obj_func, interval = c(0.01, 10))$minimum) # 범위는 0부터 5까지로 설정
+  }, error = function(e) {
+    warning("find_k_factor 계산 실패: 근사값 사용")
+    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
+  })
+}
+
+# 반복을 위한 변수 설정
+seeds <- 1:50
+PICP_values <- numeric(length(seeds))
+NMPIW_values <- numeric(length(seeds))
+
+# 반복 시작
+for (seed in seeds) {
+  set.seed(seed)
+  
+  # 데이터 준비
+  data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+  x1 <- data$BETAPLASMA
+  x2 <- data$FAT
+  y <- data$RETPLASMA
+  
+  # 샘플 분할
+  m <- length(y)
+  n_test <- 115
+  n_train <- m - n_test #200
+  idx <- sample(seq_len(m))
+  train_idx <- idx[1:n_train]
+  test_idx <- idx[(n_train+1):m]
+  train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
+  raw_train_y <- y[train_idx]
+  test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx])
+  raw_test_y <- y[test_idx]
+  
+  # 데이터 변환 (평균 및 분산 추정)
+  raw_fit <- gam(raw_train_y ~ te(train_x$x1, train_x$x2))
+  raw_pred_y <- predict(raw_fit, train_x = train_x)
+  raw_residuals <- raw_train_y - raw_pred_y
+  
+  log_res2 <- log(raw_residuals^2 + 1e-8)
+  variance_fit <- gam(log_res2 ~ te(train_x$x1, train_x$x2))
+  var_list <- exp(predict(variance_fit, train_x = train_x))
+  
+  train_y <- raw_train_y / sqrt(var_list)
+  
+  fit <- gam(train_y ~ te(train_x$x1, train_x$x2)) # 평균 추정 모델
+  residuals <- train_y - predict(fit, train_x = train_x)
+  
+  B <- predict(fit, type='lpmatrix')
+  lambda <- fit$sp[1]
+  D <- diff(diag(ncol(B)), differences=2)
+  S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
+  S <- B %*% S_inv %*% t(B)
+  I_n <- diag(nrow(S))
+  residual_matrix <- I_n - S
+  estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
+  
+  # k-factor 계산
+  norm_lx_h_values <- numeric(nrow(train_x))
+  for (j in 1:nrow(train_x)){
+    l_xh <- S[j,] # smoother matrix 의 jth row
+    norm_lx_h_values[j] <- compute_norm(l_xh)
+  }
+  
+  numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+  denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+  nu <- numerator / denominator
+  
+  k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
+  
+  # TI 계산
+  pred_y <- predict(fit, train_x=train_x)
+  TI_upper <- pred_y + k_factors * c(estimated_variance)
+  TI_lower <- pred_y - k_factors * c(estimated_variance)
+  
+  # raw_y에 대한 TI로 변환
+  raw_TI_upper <- TI_upper * sqrt(var_list)
+  raw_TI_lower <- TI_lower * sqrt(var_list)
+  train_coverage <- mean(raw_train_y >= raw_TI_lower & raw_train_y <= raw_TI_upper)
+  
+  # 선형 보간을 이용해 test의 PICP, NMPIW 계산
+  tps_lower <- Tps(x = as.matrix(train_x), Y = raw_TI_lower)
+  tps_upper <- Tps(x = as.matrix(train_x), Y = raw_TI_upper)
+  
+  test_TIlower <- predict(tps_lower, x = as.matrix(test_x))
+  test_TIupper <- predict(tps_upper, x = as.matrix(test_x))
+  
+  test_y <- raw_test_y
+  covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
+  widths <- raw_TI_upper - raw_TI_lower
+  MPIW <- mean(widths)
+  PICP <- mean(covered)
+  NMPIW <- MPIW / (max(test_y) - min(test_y))
+  
+  # 결과 저장
+  PICP_values[seed] <- PICP
+  NMPIW_values[seed] <- NMPIW
+}
+
+# 평균 계산
+mean_PICP <- mean(PICP_values)
+mean_NMPIW <- mean(NMPIW_values)
+
+cat("PICP 평균: ", mean_PICP, "\n")
+cat("NMPIW 평균: ", mean_NMPIW, "\n")
