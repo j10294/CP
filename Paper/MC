@@ -1,106 +1,122 @@
 library(splines)
+library(MASS)
 
-# Monte Carlo 실행
-set.seed(123)
-M <- 500
-models <- c(1, 2, 3, 4)
-sample_sizes <- c(50, 100, 200)
-results <- transform_function(models, sample_sizes, M, seed = 123)
-
-transformed_results <- results$transformed
-raw_results <- results$raw
 
 monte_carlo_results <- list()
-for (model in models) {
-  for (m in sample_sizes) {
-    transformed_data <- transformed_results[[paste0("Model_", model, "_m_", m)]]
-    raw_data <- raw_results[[paste0("Model_", model, "_m_", m)]]
-    
-    mc_start_time <- Sys.time()  # MC 실행 시작시간 기록
-    coverage_matrix <- matrix(0, nrow = m, ncol = M)
-    width_matrix <- matrix(0, nrow = m, ncol = M)
-    variance_estimates <- numeric(M)
-    nu_values <- numeric(M)
-    k_matrix <- matrix(0, nrow=m, ncol=M)
-    
-    lambda_values <- numeric(M)
-    
-    for (i in 1:M) {
-      #mean_lambda 계산을 위한 MC Simulation
-      x <- raw_data[[i]]$x
-      y <- transformed_data[, i]
-      fit <- smooth.spline(x = x, y = y, cv = FALSE)
+
+transform_and_evaluate <- function(models, sample_sizes, M, seed) {
+  set.seed(seed)
+  monte_carlo_results <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
+      start_time <- Sys.time()
       
-      lambda_values[i] <- fit$lambda
-    }
-    
-    mean_lambda <- mean(lambda_values, na.rm=TRUE)
+      coverage_matrix <- matrix(0, nrow = m / 2, ncol = M)
+      width_matrix <- matrix(0, nrow = m / 2, ncol = M)
       
-    for (i in 1:M){
-      
-      #MC Simulation 시작
-      x <- raw_data[[i]]$x
-      y <- transformed_data[,i]
-      fit <- smooth.spline(x=x, y=y, spar=mean_lambda)
-      
-      raw_y <- raw_data[[i]]$y
-      variance_hat <- raw_data[[i]]$variance_hat
-      
-      pred_y <- predict(fit, x)$y
-      residuals <- y - pred_y 
-      
-      #분산 계산
-      B <- bs(x, df=fit$df)
-      D <- diff(diag(ncol(B)), differences=2)
-      S_inv <- ginv(t(B) %*% B + mean_lambda * t(D) %*% D)
-      smoother_matrix <- B %*% S_inv %*% t(B)
-      I_n <- diag(m)
-      residual_matrix <- I_n - smoother_matrix
-      estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
-      if (is.na(estimated_variance) || is.nan(estimated_variance) || is.infinite(estimated_variance)) {
-        estimated_variance <- 1e-6
-      } #결측치는 매우 작은 분산으로 수정 -> TI 크기가 거의 0에 가깝게 됨.
-      variance_estimates[i] <- estimated_variance
-      
-      #전체 x값에 대해 smoothing vector과 해당되는 norm 계산
-      norm_lx_h_values <- numeric(m)
-      
-      for (j in 1:m){
-        x_h <- x[j]
-        smoothing_vector <- smoother_matrix[j,]
-        norm_lx_h_values[j] <- compute_norm(smoothing_vector)
-      }
+      for (i in 1:M) {
+        if (i %% 50 == 0) cat(sprintf("  Iteration %d / %d\n", i, M))
         
-      # k factor 계산 (find_k_factor 함수 이용, nu는 데이터에서 직접 계산)
-      numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
-      denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
-      nu <- numerator / denominator
-      nu_values[i] <- nu  
+        data_i <- generate_data(model, m)
+        x <- data_i$x
+        y <- data_i$y
+        pop <- data_i$pop
+        
+        idx <- sample(1:m, size = m / 2)
+        train_x <- x[idx]; train_y <- y[idx]
+        test_x <- x[-idx]; test_y <- y[-idx]
+        
+        fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+        pred_train <- predict(fit, train_x)$y
+        residuals <- train_y - pred_train
+        
+        log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
+        variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
+        variance_hat_test <- exp(predict(log_variance_fit, test_x)$y)
+        variance_hat_test[is.na(variance_hat_test) | is.infinite(variance_hat_test)] <- 1e-6
+        
+        transform_y_train <- train_y / sqrt(variance_hat_train)
+        fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
+        pred_test <- predict(fit_trans, test_x)$y
+        
+        B <- bs(train_x, df = fit_trans$df)
+        D <- diff(diag(ncol(B)), differences = 2)
+        S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+        S <- B %*% S_inv %*% t(B)
+        I_n <- diag(length(train_x))
+        R <- I_n - S
+        
+        residuals <- transform_y_train - predict(fit_trans, train_x)$y
+        est_var <- (t(residuals) %*% residuals) / sum(diag(t(R) %*% R))
+        est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+        
+        num <- sum(diag(t(R) %*% R))^2
+        den <- sum(diag((t(R) %*% R)^2))
+        nu <- num / den
+        
+        norm_lx_h_values <- rep(1, length(test_x))
+        k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
+        
+        TI_upper <- pred_test + sqrt(est_var) * k_factors
+        TI_lower <- pred_test - sqrt(est_var) * k_factors
+        TI_upper <- TI_upper * sqrt(variance_hat_test)
+        TI_lower <- TI_lower * sqrt(variance_hat_test)
+        
+        coverage_matrix[, i] <- (test_y >= TI_lower) & (test_y <= TI_upper)
+        width_matrix[, i] <- TI_upper - TI_lower
+      }
       
-      k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu=nu, norm_lx_h = nlh))
+      end_time <- Sys.time()
+      duration <- round(difftime(end_time, start_time, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
       
-      TI_upper <- pred_y + sqrt(estimated_variance) * k_factors
-      TI_lower <- pred_y - sqrt(estimated_variance) * k_factors
+      #PICP
+      coverage_probabilities <- rowMeans(coverage_matrix)
       
-      TI_upper <- TI_upper * sqrt(variance_hat)
-      TI_lower <- TI_lower * sqrt(variance_hat)
+      #NMPIW
+      range_y <- max(test_y) - min(test_y)
+      normalized_width <- width_matrix / range_y
+      nmpiw <- rowMeans(normalized_width)
       
-      coverage_matrix[,i] <- (raw_y >= TI_lower) & (raw_y <= TI_upper)
-      width_matrix[,i] <- TI_upper - TI_lower
-      k_matrix[,i] <- k_factors
+      #Mean Width
+      mean_width <- rowMeans(width_matrix)
+      
+      monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+        data.frame(x = sort(test_x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
     }
-    
-    # MC 실행 종료시간 기록
-    mc_end_time <- Sys.time()
-    mc_duration <- difftime(mc_end_time, mc_start_time, units='mins')
-    cat(sprintf('Monte Carlo simulation time : %.2f minutes\n', mc_duration))
-    
-    # Coverage, Width 평균 계산
-    coverage_probabilities <- rowMeans(coverage_matrix)
-    mean_width <- rowMeans(width_matrix)
-    
-    # 결과 저장
-    monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
-      data.frame(x = x, coverage_probabilities = coverage_probabilities, mean_width = mean_width)
   }
+  
+  return(monte_carlo_results)
 }
+
+seed = 123
+M=500
+models <- c(1, 2, 3, 4)
+sample_sizes <- c(50, 100, 200)
+
+# 결과 저장 
+monte_carlo_results <- transform_and_evaluate(models, sample_sizes, M, seed=seed)
+
+# 결과를 하나의 데이터프레임으로 정리
+results <- monte_carlo_results
+summary_df <- do.call(rbind, lapply(names(results), function(name) {
+  df <- monte_carlo_results[[name]]
+  df_summary <- data.frame(
+    Model = sub("Model_(\\d+)_.*", "\\1", name),
+    SampleSize = sub("._m_(\\d+)", "\\1", name),
+    PICP = mean(df$coverage_probabilities, na.rm=TRUE),
+    NMPIW = mean(df$NMPIW, na.rm=TRUE)
+  )
+  return(df_summary)
+}))
+
+summary_df
+summary_df$SampleSize <- as.integer(gsub("Model_", "", summary_df$SampleSize))
+summary_df$Model <- as.integer(summary_df$Model)
+summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
+
+library(knitr)
+kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW')
+
