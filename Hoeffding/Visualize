@@ -1,41 +1,96 @@
-# Function to Plot Results
-plot_model_results <- function(monte_carlo_results, model_num) {
-  plot_list <- list()
 
-  model_results <- Filter(function(res) res$model == model_num, monte_carlo_results)
-  
-  for (res in model_results) {
-    coverage_data <- res$coverage
+library(gam)
+library(gridExtra)
+library(ggplot2)
 
-    if (nrow(coverage_data) == 0) {
-      next
-    }
+# 데이터 생성
+generate_data <- function(model, n) {
+  x <- seq(0, 10, length.out = n)
+  pop <- 3 * cos(x) - 5 * (x / 15)^2
+  if (model == 1) y <- pop + rnorm(n, 0, sqrt(2))
+  if (model == 2) y <- pop + rnorm(n, 0, sqrt(2 * x))
+  if (model == 3) y <- pop + 4 - rgamma(n, shape = 2, scale = 2)
+  if (model == 4) y <- pop + rt(n, df = 3)
+  data.frame(x = x, y = y)
+}
 
-    p1 <- ggplot(coverage_data, aes(x = x, y = covered)) +
-      geom_point(color = 'red') +
-      geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'black') +
-      labs(title = paste("Pointwise Coverage (Model", model_num, ")"),
-           x = "x", y = "Coverage Probability") +
-      ylim(0, 1) +
-      theme_minimal() +
-      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
-
-    p2 <- ggplot(coverage_data, aes(x = x, y = width)) +
-      geom_point(size = 0.5, na.rm = TRUE, color = 'blue') +
-      labs(title = paste("Interval Width (Model", model_num, ")"),
-           x = "x", y = "Interval Width") +
-      theme_minimal() +
-      theme(plot.title = element_text(hjust = 0.5, size = 12, face = 'bold'))
-
-    plot_list <- append(plot_list, list(p1, p2))
+# lambda 계산
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n) {
+  f <- function(lambda) {
+    risk <- mean(y <= pred - sqrt(variance) * lambda | y >= pred + sqrt(variance) * lambda, na.rm = TRUE)
+    threshold <- (1 - alpha) - sqrt(log(1 / delta) / (2 * n))
+    risk - threshold
   }
+  tryCatch({
+    uniroot(f, c(0, 5))$root
+  }, error = function(e) {
+    optimize(f, c(0, 5))$minimum
+  })
+}
 
-  if (length(plot_list) == 0) {
-    cat(sprintf("No valid data to plot for Model %d\n", model_num))
-    return(NULL)
+# 설정
+models <- 1:4
+sample_sizes <- c(50, 100, 200)
+alpha <- 0.95
+delta <- 0.90
+set.seed(6)
+
+plot_list_all_models <- list()
+
+for (model in models) {
+  for (n in sample_sizes) {
+    data <- generate_data(model, n)
+    idx <- sample(n)
+    n_test <- n/2
+    n_train <- floor(n/4)
+    n_cal <- n - n_test - n_train
+    train_x <- data$x[idx[1:n_train]]
+    train_y <- data$y[idx[1:n_train]]
+    cal_x <- data$x[idx[(n_train + 1):(2 * n_train)]]
+    cal_y <- data$y[idx[(n_train + 1):(2 * n_train)]]
+    test_x <- data$x[idx[(2 * n_train + 1):n]]
+    test_y <- data$y[idx[(2 * n_train + 1):n]]
+    
+    fit <- smooth.spline(train_x, train_y, cv = FALSE)
+    cal_pred <- predict(fit, cal_x)$y
+    train_res <- train_y - predict(fit, train_x)$y
+    
+    log_res2 <- log(train_res^2 + 1e-10)
+    gam_model <- gam(log_res2 ~ s(train_x))
+    log_pred <- predict(gam_model, newdata = data.frame(train_x = cal_x))
+    cal_var <- exp(log_pred)
+    
+    lambda_hat <- find_lambda_hat(alpha, delta, cal_y, cal_pred, cal_var, length(cal_y))
+    TI_upper <- cal_pred + sqrt(cal_var) * lambda_hat
+    TI_lower <- cal_pred - sqrt(cal_var) * lambda_hat
+    
+    interp_upper <- approx(cal_x, TI_upper, test_x, rule = 2)$y
+    interp_lower <- approx(cal_x, TI_lower, test_x, rule = 2)$y
+    covered <- (test_y >= interp_lower) & (test_y <= interp_upper)
+    picp <- mean(covered, na.rm = TRUE)
+    nmpiw <- mean(interp_upper - interp_lower, na.rm = TRUE) / (max(test_y) - min(test_y))
+    
+    df_TI <- data.frame(x = cal_x, lower = TI_lower, upper = TI_upper)
+    df_test <- data.frame(x = test_x, y = test_y, covered = covered)
+    
+    p <- ggplot() +
+      geom_ribbon(data = df_TI, aes(x = x, ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
+      geom_point(data = df_test, aes(x = x, y = y, color = covered), size = 1.5) +
+      scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+      labs(
+        title = paste("Model", model, "- Sample size =", n),
+        subtitle = sprintf("PICP = %.3f, NMPIW = %.3f", picp, nmpiw),
+        x = "x", y = "y"
+      ) +
+      theme_minimal(base_size = 12)
+    
+    plot_list_all_models[[paste0("Model_", model, "_n_", n)]] <- p
   }
+}
 
-  model_title <- textGrob(paste("Model", model_num), gp = gpar(fontsize = 13, fontface = "bold"))
-  grid.arrange(model_title, do.call(arrangeGrob, c(plot_list, ncol = 2)),
-               ncol = 1, heights = c(0.2, 5))
+
+# 모델별 3x1 plot 출력
+for (model in models) {
+  plots <- lapply(sample_sizes, function(n) plot_list_all_models[[paste0("Model_", model, "_n_", n)]])
+  grid.arrange(grobs = plots, ncol = 1, top = paste("Model", model))
 }
