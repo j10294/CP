@@ -113,3 +113,25 @@ transform_function <- function(models, sample_sizes, M, seed) {
   
   return(list(transformed = transformed_data_list, raw = raw_data_list))
 }
+
+# 7. 시각화 함수
+plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw, cwc) {
+  df <- data.frame(
+    x = x, y = y,
+    lower = TI_lower, upper = TI_upper,
+    pred = pred_mean, covered = covered
+  )
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(aes(color = covered), size = 1.5) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
+    geom_line(aes(y = pred), color = "darkgreen", size = 0.7) +
+    labs(
+      title = paste0("TI for ", varname),
+      subtitle = sprintf("PICP=%.3f, NMPIW=%.3f, CWC=%.3f", picp, nmpiw, cwc),
+      x = "x", y = varname
+    ) +
+    theme_minimal(base_size = 11) +
+    scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red"))
+  return(p)
+}
+
