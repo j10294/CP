@@ -57,6 +57,7 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
     return(optimize(obj_func, interval = c(0.01, 5))$minimum)
   }, error = function(e) {
     warning("find_k_factor 계산 실패")
+    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
   })
 }
 
