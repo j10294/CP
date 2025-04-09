@@ -23,7 +23,8 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
 }
 #-----------------------------------------------------------# 필요한 함수 ##
 
-
+library(gam)
+library(MASS)
 
 data <- read.csv('/Users/hdmt306/Downloads/plasma.csv')
 exclude_vars <- c("SEX", "SMOKSTAT", "VITUSE", "ALCOHOL", "BETADIET", "BETAPLASMA", "RETPLASMA")
@@ -41,6 +42,9 @@ for (y_var in target_vars) {
   
   for (seed in 1:50) {
     cat('  Seed:', seed, '계산 중 ...\n')
+
+    x <- data$AGE
+    y <- data$y_var
     
     set.seed(seed)
     m <- length(y)
