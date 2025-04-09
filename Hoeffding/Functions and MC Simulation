@@ -64,9 +64,9 @@ for (model in models){
       y <- data$y
       
       m <- nrow(data)
+      n_test <- n/2
       n_train <- floor(n/4)
-      n_cal <- floor(n/4)
-      n_test <- m-n_train-n_cal
+      n_cal <- n - n_test - n_train
     
       # 데이터 샘플링
       all_indices <- sample(n)
@@ -134,3 +134,12 @@ for (model in models){
                 model, n, PICP_mean, NMPIW_mean, elapsed))
   }
 }
+
+# 결과 정리해서 출력 
+library(dplyr)
+result_summary <- results %>%
+  mutate(PICP_mean = round(PICP_mean, 4), NMPIW_mean = round(NMPIW_mean, 4)
+  ) %>%
+  arrange(model, sample_size)
+print(result_summary)
+
