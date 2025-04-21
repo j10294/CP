@@ -1,26 +1,93 @@
 #-----------------------------------------------------------# 필요한 함수 ##
+# 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
-find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
-  obj_func <- function(k) {
-    integral_result <- tryCatch({
-      integrate(integrand, lower = 0, upper =50, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
-    }, error = function(e) {
-      warning("적분 실패")
-      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
-    })
-    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
-  }
+# 확률 계산 함수 (Prop 3.1 내부)
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 10))$minimum) # 범위는 0부터 5까지로 설정
+    q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1) #이 값이 k^2보다 크면, probability가 0으로 감.
+    
+    if (lhs <= k^2) {
+      threshold <- (nu * q_val) / (k^2)
+      probability <- pchisq(threshold, df = nu, lower.tail = FALSE) #probability term
+      
+      if (is.na(probability) || is.nan(probability)) return(1e-6)
+      return(probability)
+    } else {
+      return(0) #이 값이 k^2보다 크면, probability가 0으로 감.
+    }
   }, error = function(e) {
-    warning("find_k_factor 계산 실패: 근사값 사용")
-    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
+    warning("compute_probability 계산 오류 발생")
+    return(0)
   })
 }
+
+# 적분 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
+
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  return(exp_term * prob_term)
+}
+
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 100, by = 0.05)  # 탐색 구간
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(lhs <= k^2)
+  })
+  
+  if (any(valid_t)) {
+    return(max(t_seq[valid_t]))
+  } else {
+    warning("조건을 만족하는 t가 없음 — fallback to t = 10")
+    return(10)
+  }
+}
+
+# k-factor 계산 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
+      warning("upper_bound가 이상함 → fallback")
+      return(Inf) #upperbound 상한값을 inf로 설정
+    }
+    
+    result <- tryCatch({
+      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
+                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+      if (is.na(integral_result) || is.nan(integral_result)) return(Inf)
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      error <- abs((pi_term * integral_result) - gamma)
+      
+      cat("k =", round(k, 5), 
+          ", integral =", round(estimate, 5), 
+          ", error =", round(error, 5), "\n")
+      
+    }, error = function(e) {
+      warning("적분 실패")
+      return(Inf)
+    })
+    
+    return(result)
+  }
+  
+  
+  tryCatch({
+    return(optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)$minimum)
+  }, error = function(e) {
+    warning("k 최적화 실패")
+    return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
+  })
+}
+
 #-----------------------------------------------------------# 필요한 함수 ##
 
 library(gam)
@@ -40,7 +107,7 @@ for (y_var in target_vars) {
   nmpiw_vals <- numeric(50)
   
   for (seed in 1:50) {
-    cat('  Seed:', seed, '계산 중 ...\n')
+    #cat('  Seed:', seed, '계산 중 ...\n')
     
     x <- data$AGE
     y <- data$y_var
@@ -86,7 +153,7 @@ for (y_var in target_vars) {
     residual_matrix <- I_n - smoother_matrix
     
     estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
-    cat('추정된 단일 분산 : ', estimated_variance)
+    #cat('추정된 단일 분산 : ', estimated_variance)
     
     # 5. k factor 계산
     norm_lx_h_values <- numeric(length(train_x)) #200개 
@@ -172,6 +239,7 @@ for (y_var in target_vars) {
   cat("✅", y_var, "변수의 평균 NMPIW:", mean_NMPIW, "\n")
 }
 
+warnings()
 # results_list를 이용해서 변수별로 시드에 대한 결과 정리
 final_results_list <- list()
 
