@@ -75,7 +75,6 @@ cat('추정된 단일 분산 : ', estimated_variance)
 # 5. k factor 계산
 
 #-----------------------------------------------------------# 필요한 함수 ##
-#-----------------------------------------------------------# 필요한 함수 ##
 # 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
@@ -106,7 +105,7 @@ compute_probability <- function(nu, t, P, k, norm_lx_h) {
 integrand <- function(t, k, nu, P, norm_lx_h) {
   exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
   if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
-
+  
   prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
   return(exp_term * prob_term)
 }
@@ -131,11 +130,10 @@ find_upper_bound_t <- function(k, nu, P) {
 find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
   obj_func <- function(k) {
     upper_bound <- find_upper_bound_t(k, nu, P)
-    cat("k =", k, ", upper_bound =", upper_bound, "\n")
     
     if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
       warning("upper_bound가 이상함 → fallback")
-      return(10) #upperbound 상한값을 10으로 설정 
+      return(Inf) #upperbound 상한값을 inf로 설정
     }
     
     result <- tryCatch({
@@ -143,7 +141,12 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
                                    k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
       if (is.na(integral_result) || is.nan(integral_result)) return(Inf)
       pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-      abs((pi_term * integral_result) - gamma)
+      error <- abs((pi_term * integral_result) - gamma)
+      
+      cat("k =", round(k, 5), 
+          ", integral =", round(estimate, 5), 
+          ", error =", round(error, 5), "\n")
+      
     }, error = function(e) {
       warning("적분 실패")
       return(Inf)
@@ -154,7 +157,7 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
   
   
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 5))$minimum)
+    return(optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)$minimum)
   }, error = function(e) {
     warning("k 최적화 실패")
     return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
@@ -238,5 +241,7 @@ interval_width <- interp_upper - interp_lower
 y_range <- max(raw_test_y) - min(raw_test_y)
 NMPIW <- mean(interval_width) / y_range
 cat("✅ NMPIW (Normalized Mean Prediction Interval Width):", round(NMPIW, 4), "\n")
+
+
 
 
