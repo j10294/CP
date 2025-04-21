@@ -57,26 +57,67 @@ cat('추정된 단일 분산 : ', estimated_variance)
 # 5. k factor 계산
 
 #-----------------------------------------------------------# 필요한 함수 ##
+# 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
+
+
+# 확률 계산 함수 (Prop 3.1 내부)
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1) #이 값이 k^2보다 크면, probability가 0으로 감.
+    
+    if (lhs <= k^2) {
+      threshold <- (nu * q_val) / (k^2)
+      probability <- pchisq(threshold, df = nu, lower.tail = FALSE) #probability term
+      
+      if (is.na(probability) || is.nan(probability)) return(1e-6)
+      return(probability)
+    } else {
+      return(0) #이 값이 k^2보다 크면, probability가 0으로 감.
+    }
+  }, error = function(e) {
+    warning("compute_probability 계산 오류 발생")
+    return(0)
+  })
+}
+
+
+# 적분 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
+  
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  return(exp_term * prob_term)
+}
+
+# k-factor 계산 함수
 find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
   obj_func <- function(k) {
-    integral_result <- tryCatch({
-      integrate(integrand, lower = 0, upper =50, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    
+    result <- tryCatch({
+      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
+                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      abs((pi_term * integral_result) - gamma)
     }, error = function(e) {
       warning("적분 실패")
-      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
+      return(Inf)
     })
-    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
+    
+    return(result)
   }
+  
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 10))$minimum) # 범위는 0부터 5까지로 설정
+    return(optimize(obj_func, interval = c(0.01, 5))$minimum)
   }, error = function(e) {
-    warning("find_k_factor 계산 실패: 근사값 사용")
-    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
+    warning("k 최적화 실패")
+    return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
   })
 }
 #-----------------------------------------------------------# 필요한 함수 ##
