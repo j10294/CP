@@ -1,10 +1,22 @@
 ## paper 코드 수정 (단일 변수, 단일 시드에 대해 1번 수행하는 코드)
+library(splines)
+library(gam)
+library(MASS)
+
+## paper 코드 수정 (단일 변수, 단일 시드에 대해 1번 수행하는 코드)
 
 
 # 1. 데이터 준비
 data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
 x <- data$AGE
 y <- data$BETADIET
+
+# 데이터 정제 함수
+clean_data <- function(x, y) {
+  valid_idx <- which(!is.na(x) & !is.na(y) &
+                       !is.infinite(x) & !is.infinite(y))
+  return(list(x = x[valid_idx], y = y[valid_idx]))
+}
 
 # 2. 샘플 분할
 set.seed(1)
@@ -21,6 +33,10 @@ raw_train_y <- y[train_idx]
 test_x <- x[test_idx]
 raw_test_y <- y[test_idx]
 
+train_clean <- clean_data(train_x, raw_train_y)
+train_x <- train_clean$x
+raw_train_y <- train_clean$y
+
 # 3. train data 를 이용해 분산 추정 후 데이터 변환
 
 # 평균 추정
@@ -29,19 +45,21 @@ raw_pred_y <- predict(raw_fit, train_x)$y
 raw_residuals <- raw_train_y - raw_pred_y
 
 # 분산 추정
-variance_fit <- gam(raw_residuals^2 ~ s(train_x))
-var_list <- predict(variance_fit,newdata = data.frame(train_x = x)) #315개의 추정된 분산을 가진 벡터
-
-# y값 변화
-transform_y <- y/sqrt(var_list); transform_y #표준편차로 나누어 표준화시킨 데이터
-
-# 새로운 train_y, test_y 정의
-train_y <- transform_y[train_idx]
-test_y <- transform_y[test_idx]
+fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log")) # 음수 안나오도록 로그 사용 
+var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
   
+# y값 변화
+transform_y <- raw_train_y/sqrt(var_list) #표준편차로 나누어 표준화시킨 데이터
+transform_clean <- clean_data(train_x, transform_y) #표준화 시킨 데이터도 정제
+
+train_x <- transform_clean$x
+train_y <- transform_clean$y
+
 
 #4. Paper method 이용해서 단일 분산 추정
-fit <- smooth.spline(train_x, train_y, cv=FALSE)
+
+fit <- smooth.spline(train_x, train_y, cv = FALSE)
+
 residuals <- predict(fit, train_x)$y - train_y
 
 B <- bs(train_x, df=max(fit$df),3)
@@ -142,8 +160,8 @@ TI_upper <- pred_y + k_factors*c(estimated_variance)
 TI_lower <- pred_y - k_factors*c(estimated_variance)
 
 # 7. raw_y 에 대한 TI로 변환
-raw_TI_upper <- TI_upper * sqrt(var_list[train_idx])
-raw_TI_lower <- TI_lower * sqrt(var_list[train_idx])
+raw_TI_upper <- TI_upper * sqrt(var_list)
+raw_TI_lower <- TI_lower * sqrt(var_list)
 train_coverage <- mean(raw_train_y >= raw_TI_lower & raw_train_y <= raw_TI_upper)
 cat('훈련 세트의 커버리지 평균 : ', train_coverage)
 
@@ -151,7 +169,7 @@ cat('훈련 세트의 커버리지 평균 : ', train_coverage)
 library(ggplot2)
 plot_df <- data.frame(
   x = train_x,
-  pred_y = predict(fit, train_x)$y * sqrt(var_list[train_idx]),  # 원래 스케일로 예측값 변환
+  pred_y = predict(fit, train_x)$y * sqrt(var_list),  # 원래 스케일로 예측값 변환
   TI_lower = raw_TI_lower,
   TI_upper = raw_TI_upper
 )
@@ -197,3 +215,5 @@ interval_width <- interp_upper - interp_lower
 y_range <- max(raw_test_y) - min(raw_test_y)
 NMPIW <- mean(interval_width) / y_range
 cat("✅ NMPIW (Normalized Mean Prediction Interval Width):", round(NMPIW, 4), "\n")
+
+
