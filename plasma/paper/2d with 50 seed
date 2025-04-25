@@ -1,109 +1,205 @@
-# 필요한 패키지
-library(mgcv)
-library(fields)
+#-----------------------------------------------------------# 필요한 함수 ##
+# 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
-find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
-  obj_func <- function(k) {
-    integral_result <- tryCatch({
-      integrate(integrand, lower = 0, upper =50, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
-    }, error = function(e) {
-      warning("적분 실패")
-      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
-    })
-    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
-  }
+# 확률 계산 함수 (Prop 3.1 내부)
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 10))$minimum) # 범위는 0부터 5까지로 설정
+    q_val <- suppressWarnings(qchisq(P, df = 1, ncp = t^2))
+    if (is.na(q_val) || is.nan(q_val) || is.infinite(q_val)) return(1e-6)
+    
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    if (lhs <= k^2) {
+      threshold <- (nu * q_val) / (k^2)
+      prob <- suppressWarnings(pchisq(threshold, df = nu, lower.tail = FALSE))
+      if (is.na(prob) || is.nan(prob) || is.infinite(prob)) return(1e-6)
+      return(prob)
+    } else {
+      return(0)
+    }
   }, error = function(e) {
-    warning("find_k_factor 계산 실패: 근사값 사용")
-    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
+    warning("compute_probability 계산 오류 발생")
+    return(1e-6)
   })
 }
 
-# 반복을 위한 변수 설정
-seeds <- 1:50
-PICP_values <- numeric(length(seeds))
-NMPIW_values <- numeric(length(seeds))
 
-# 반복 시작
-for (seed in seeds) {
-  set.seed(seed)
+# 적분 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  # exp_term 계산
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  exp_term[is.nan(exp_term) | is.infinite(exp_term) | exp_term < 1e-10] <- 0
   
-  # 데이터 준비
-  data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
-  x1 <- data$BETAPLASMA
-  x2 <- data$FAT
-  y <- data$RETPLASMA
+  # prob_term 계산 (벡터 t에 대해 반복 적용)
+  prob_term <- sapply(t, function(ti) {
+    compute_probability(nu, ti, P, k, norm_lx_h)
+  })
   
-  # 샘플 분할
+  # 결합 및 방어
+  result <- exp_term * prob_term
+  result[is.nan(result) | is.infinite(result)] <- 0
+  return(result)
+}
+
+
+
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 20, by = 0.01)  # 너무 큰 t는 제거 (적분 범위가 커져서 실패 위험 높아짐)
+  
+  for (t in t_seq) {
+    q_val <- suppressWarnings(qchisq(P, df = 1, ncp = t^2))
+    if (is.na(q_val) || is.nan(q_val) || is.infinite(q_val)) next
+    
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    if (!is.na(lhs) && lhs <= k^2) {
+      return(t)  # 조건 만족하는 최소의 t 반환
+    }
+  }
+  
+  warning("❌ 조건 만족하는 t를 찾지 못했음 — fallback to t = 10")
+  return(10)
+}
+
+
+
+# k-factor 계산 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) return(NA)
+    
+    result <- tryCatch({
+      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
+                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+      if (is.na(integral_result) || is.nan(integral_result)) return(NA)
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      error <- abs((pi_term * integral_result) - gamma)
+      return(error)
+    }, error = function(e) NA)
+    
+    return(result)
+  }
+  
+  opt_result <- tryCatch({
+    optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)
+  }, error = function(e) NULL)
+  
+  if (!is.null(opt_result) &&
+      is.list(opt_result) &&
+      is.numeric(opt_result$objective) &&
+      !is.na(opt_result$objective) &&
+      is.finite(opt_result$objective)) {
+    return(list(k = opt_result$minimum, fallback = FALSE))
+  } else {
+    approx_k <- sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) /
+                       qchisq(p = 1 - gamma, df = nu, ncp = 0))
+    return(list(k = approx_k, fallback = TRUE))
+  }
+}
+
+
+
+#-----------------------------------------------------------# 필요한 함수 ##
+
+library(mgcv)
+library(fields)
+library(MASS)
+
+# 데이터 로드
+data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+x1 <- data$BETAPLASMA
+x2 <- data$FAT
+y <- data$RETPLASMA
+
+# 결과 저장용 리스트
+results <- list()
+
+# 반복: 시드 1~50
+for (s in 1:50) {
+  start_time <- Sys.time()
+  set.seed(s)
   m <- length(y)
   n_test <- 115
-  n_train <- m - n_test #200
+  n_train <- m - n_test
+  
   idx <- sample(seq_len(m))
   train_idx <- idx[1:n_train]
   test_idx <- idx[(n_train+1):m]
+  
   train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
   raw_train_y <- y[train_idx]
   test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx])
   raw_test_y <- y[test_idx]
   
-  # 데이터 변환 (평균 및 분산 추정)
+  # 평균 추정
   raw_fit <- gam(raw_train_y ~ te(train_x$x1, train_x$x2))
   raw_pred_y <- predict(raw_fit, train_x = train_x)
   raw_residuals <- raw_train_y - raw_pred_y
   
+  # 분산 추정
   log_res2 <- log(raw_residuals^2 + 1e-8)
   variance_fit <- gam(log_res2 ~ te(train_x$x1, train_x$x2))
   var_list <- exp(predict(variance_fit, train_x = train_x))
   
+  # 정규화된 y
   train_y <- raw_train_y / sqrt(var_list)
   
-  fit <- gam(train_y ~ te(train_x$x1, train_x$x2)) # 평균 추정 모델
+  # 평활 추정
+  fit <- gam(train_y ~ te(train_x$x1, train_x$x2))
   residuals <- train_y - predict(fit, train_x = train_x)
   
-  B <- predict(fit, type='lpmatrix')
+  B <- predict(fit, type = 'lpmatrix')
   lambda <- fit$sp[1]
-  D <- diff(diag(ncol(B)), differences=2)
+  D <- diff(diag(ncol(B)), differences = 2)
   S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
   S <- B %*% S_inv %*% t(B)
   I_n <- diag(nrow(S))
   residual_matrix <- I_n - S
-  estimated_variance <- (t(residuals) %*% residuals) / (sum(diag(t(residual_matrix) %*% residual_matrix)))
   
-  # k-factor 계산
-  norm_lx_h_values <- numeric(nrow(train_x))
-  for (j in 1:nrow(train_x)){
-    l_xh <- S[j,] # smoother matrix 의 jth row
-    norm_lx_h_values[j] <- compute_norm(l_xh)
-  }
+  estimated_variance <- as.numeric((t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix)))
   
+  # 자유도 추정
   numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
   denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
   nu <- numerator / denominator
   
-  k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
+  # norm 계산
+  norm_lx_h_values <- apply(S, 1, compute_norm)
+  
+  # k-factor 계산 (근사 사용했는지 여부 추가)
+  k_results <- mapply(function(nlh, i) {
+    result <- find_k_factor(nu = nu, norm_lx_h = nlh, index = i)
+    return(result)
+  }, norm_lx_h_values, seq_along(norm_lx_h_values), SIMPLIFY = FALSE)
+  
+  k_factors <- sapply(k_results, function(res) res$k)
+  fallback_flags <- sapply(k_results, function(res) res$fallback)
+  num_fallbacks <- sum(fallback_flags)
+  
   
   # TI 계산
-  pred_y <- predict(fit, train_x=train_x)
-  TI_upper <- pred_y + k_factors * c(estimated_variance)
-  TI_lower <- pred_y - k_factors * c(estimated_variance)
+  pred_y <- predict(fit, train_x = train_x)
+  TI_upper <- pred_y + k_factors * estimated_variance
+  TI_lower <- pred_y - k_factors * estimated_variance
   
-  # raw_y에 대한 TI로 변환
+  # 원래 단위로 변환
   raw_TI_upper <- TI_upper * sqrt(var_list)
   raw_TI_lower <- TI_lower * sqrt(var_list)
-  train_coverage <- mean(raw_train_y >= raw_TI_lower & raw_train_y <= raw_TI_upper)
   
-  # 선형 보간을 이용해 test의 PICP, NMPIW 계산
+  # 선형보간
+  # Tps 경고 메시지 제거용 sink
+  sink(tempfile())  # 콘솔 출력을 임시 파일로 보냄
   tps_lower <- Tps(x = as.matrix(train_x), Y = raw_TI_lower)
   tps_upper <- Tps(x = as.matrix(train_x), Y = raw_TI_upper)
+  sink()  # 콘솔 출력을 원래대로 복구
+  
   
   test_TIlower <- predict(tps_lower, x = as.matrix(test_x))
   test_TIupper <- predict(tps_upper, x = as.matrix(test_x))
   
+  # 평가 지표
   test_y <- raw_test_y
   covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
   widths <- raw_TI_upper - raw_TI_lower
@@ -111,14 +207,14 @@ for (seed in seeds) {
   PICP <- mean(covered)
   NMPIW <- MPIW / (max(test_y) - min(test_y))
   
-  # 결과 저장
-  PICP_values[seed] <- PICP
-  NMPIW_values[seed] <- NMPIW
+  results[[s]] <- data.frame(seed = s, PICP = PICP, NMPIW = NMPIW)
+  
+  elapsed <- Sys.time() - start_time
+  cat(sprintf("✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f | 소요시간: %.2f 초 | fallback k: %d개\n",
+              s, PICP, NMPIW, as.numeric(elapsed, units = "secs"), num_fallbacks))
+  
 }
 
-# 평균 계산
-mean_PICP <- mean(PICP_values)
-mean_NMPIW <- mean(NMPIW_values)
-
-cat("PICP 평균: ", mean_PICP, "\n")
-cat("NMPIW 평균: ", mean_NMPIW, "\n")
+# 결과 통합
+results_df <- do.call(rbind, results)
+results_df
