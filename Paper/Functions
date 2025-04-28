@@ -2,12 +2,6 @@ library(splines)
 library(foreach)
 library(doParallel)
 
-
-#  CPU 코어 개수 확인 및 병렬 클러스터 설정
-num_cores <- detectCores() - 1 
-cl <- makeCluster(num_cores)
-registerDoParallel(cl)
-
 # 1. 데이터 생성 함수 정의
 generate_data <- function(model, n) {
   x <- seq(0, 10, length.out = n)
@@ -119,9 +113,14 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
     
   }, error = function(e) {
     warning("k 최적화 실패")
-    return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
+    #return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
   })
 }
+
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
 
 # 6. 데이터 변환 함수 
 transform_function <- function(models, sample_sizes, M, seed) {
