@@ -171,12 +171,7 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
 #-----------------------------------------------------------# 필요한 함수 ##
 
 
-norm_lx_h_values <- numeric(length(train_x)) #200개 
-for (j in 1:length(train_x)){
-  x_h <- train_x[j]
-  smoothing_vector <- smoother_matrix[j,]
-  norm_lx_h_values[j] <- compute_norm(smoothing_vector)
-}
+norm_lx_h_values <- apply(S, 2, compute_norm)
 
 numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
 denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
