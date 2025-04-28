@@ -1,0 +1,357 @@
+library(splines)
+library(foreach)
+library(progressr)
+library(doFuture)
+library(future)
+library(splines)
+library(MASS)
+
+# 병렬 세팅 (doFuture + future 사용!)
+plan(multisession, workers = detectCores() - 1)
+registerDoFuture()
+
+
+
+#  CPU 코어 개수 확인 및 병렬 클러스터 설정
+plan(multisession, workers = detectCores() - 1)
+registerDoFuture()
+handlers(global = TRUE) # progressr 핸들 활성화
+
+# 1. 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  x <- seq(0, 10, length.out = n)
+  pop <- 3 * cos(x) - 5 * (x / 15)^2
+  if (model == 1) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  }
+  return(data.frame(x = x, y = y, pop = pop))
+}
+
+# 2. 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+# 3. Prop 3.1 내의 확률부분을 계산하는 함수 
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1) #이 값이 k^2보다 크면, probability가 0으로 감.
+    
+    if (lhs <= k^2) {
+      threshold <- (nu * q_val) / (k^2)
+      probability <- pchisq(threshold, df = nu, lower.tail = FALSE) #probability term
+      
+      if (is.na(probability) || is.nan(probability)) return(1e-6)
+      return(probability)
+    } else {
+      return(0) #이 값이 k^2보다 크면, probability가 0으로 감.
+    }
+  }, error = function(e) {
+    warning("compute_probability 계산 오류 발생")
+    return(0)
+  })
+}
+
+# 4. Prop 3.1 의 적분식을 계산하는 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
+  
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  return(exp_term * prob_term)
+}
+
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 100, by = 0.05)  # 탐색 구간
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(lhs <= k^2)
+  })
+  
+  if (any(valid_t)) {
+    return(max(t_seq[valid_t]))
+  } else {
+    warning("조건을 만족하는 t가 없음 — fallback to t = 10")
+    return(10)
+  }
+}
+
+# k-factor 계산 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
+  start_time <- Sys.time()
+  cat("▶️ k-factor 계산 시작: index =", index, "\n")
+  
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
+      warning("upper_bound가 이상함 → fallback")
+      return(Inf) #upperbound 상한값을 inf로 설정
+    }
+    
+    result <- tryCatch({
+      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
+                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+      if (is.na(integral_result) || is.nan(integral_result)) return(Inf)
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      error <- abs((pi_term * integral_result) - gamma)
+      
+      cat("  ⏳ k =", round(k, 5), 
+          ", upper bound of t ", upper_bound, 
+          ", integral =", round(pi_term * integral_result, 5), 
+          ", error =", round(error, 5), "\n")
+      
+    }, error = function(e) {
+      warning("적분 실패")
+      return(Inf)
+    })
+    
+    return(result)
+  }
+  
+  
+  tryCatch({
+    return(optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)$minimum)
+    elapsed <- Sys.time() - start_time
+    cat("✅ index =", index, ", 최적 k =", round(out, 5), ", 시간:", round(elapsed, 2), "초\n")
+    
+  }, error = function(e) {
+    warning("k 최적화 실패")
+    #return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
+  })
+}
+
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
+
+# 6. 데이터 변환 함수 
+transform_function <- function(models, sample_sizes, M, seed) {
+  set.seed(seed)
+  transformed_data_list <- list()
+  raw_data_list <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      transformed_data <- matrix(NA, nrow = m, ncol = M)
+      raw_data <- vector("list", M)
+      
+      # 데이터의 분산을 추정해 추정된 분산으로 데이터를 나누어 transform
+      for (i in 1:M) {
+        data <- generate_data(model, m)
+        x <- data$x
+        y <- data$y
+        fit <- smooth.spline(x = x, y = y, cv = FALSE) #논문 방법과 동일하게 GCV 사용
+        pred_y <- predict(fit, x)$y
+        residuals <- y - pred_y
+        
+        log_variance_fit <- smooth.spline(x = x, y = log(residuals^2 + 1e-6), cv = FALSE)
+        log_variance_hat <- predict(log_variance_fit, x)$y
+        variance_hat <- exp(log_variance_hat)
+        
+        variance_hat[is.nan(variance_hat) | is.infinite(variance_hat)] <- 1e-6
+        transform_y <- y / sqrt(variance_hat)
+        
+        transformed_data[, i] <- transform_y
+        raw_data[[i]] <- data.frame(x = x, y = y, variance_hat = variance_hat)
+      }
+      
+      transformed_data_list[[paste0("Model_", model, "_m_", m)]] <- transformed_data
+      raw_data_list[[paste0("Model_", model, "_m_", m)]] <- raw_data
+    }
+  }
+  
+  return(list(transformed = transformed_data_list, raw = raw_data_list))
+}
+
+# 7. 시각화 함수
+plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw, cwc) {
+  df <- data.frame(
+    x = x, y = y,
+    lower = TI_lower, upper = TI_upper,
+    pred = pred_mean, covered = covered
+  )
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(aes(color = covered), size = 1.5) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
+    geom_line(aes(y = pred), color = "darkgreen", size = 0.7) +
+    labs(
+      title = paste0("TI for ", varname),
+      subtitle = sprintf("PICP=%.3f, NMPIW=%.3f, CWC=%.3f", picp, nmpiw, cwc),
+      x = "x", y = varname
+    ) +
+    theme_minimal(base_size = 11) +
+    scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red"))
+  return(p)
+}
+
+
+
+library(splines)
+library(MASS)
+
+
+monte_carlo_results <- list()
+
+transform_and_evaluate <- function(models, sample_sizes, M, seed) {
+  set.seed(seed)
+  monte_carlo_results <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
+      start_time <- Sys.time()
+      
+      k_lookup_table <- new.env()
+      
+      with_progress({
+        p <- progressor(steps=M)
+      
+        # 병렬 처리 
+        results_list <- foreach(i = 1:M, .packages=c('splines', 'MASS', 'foreach','doParallel'),
+                                .export = c("generate_data", "find_k_factor", "find_upper_bound_t", 
+                                            "find_k_factor_fast", "compute_probability", "integrand", "compute_norm")
+                                ) %dopar% {
+          
+          p() #progress bar 한 칸 채우기 
+                                  
+                                  
+          data_i <- generate_data(model, m)
+          x <- data_i$x
+          y <- data_i$y
+          pop <- data_i$pop
+          
+          idx <- sample(1:m, size = m / 2)
+          train_x <- x[idx]; train_y <- y[idx]
+          test_x <- x[-idx]; test_y <- y[-idx]
+          
+          fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+          pred_train <- predict(fit, train_x)$y
+          residuals <- train_y - pred_train
+          
+          log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
+          variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
+          
+          transform_y_train <- train_y / sqrt(variance_hat_train)
+          fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
+          
+          B <- bs(train_x, df = fit_trans$df)
+          D <- diff(diag(ncol(B)), differences = 2)
+          S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+          S <- B %*% S_inv %*% t(B)
+          I_n <- diag(length(train_x))
+          R <- I_n - S
+          
+          residuals <- transform_y_train - predict(fit_trans, train_x)$y
+          est_var <- (t(residuals) %*% residuals) / sum(diag(t(R) %*% R))
+          est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+          
+          num <- sum(diag(t(R) %*% R))^2
+          den <- sum(diag((t(R) %*% R)^2))
+          nu <- num / den
+          
+          
+          # k factor 계산 
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
+          rounded_nlh_values <- round(norm_lx_h_values, 2)
+          unique_nlh_values <- sort(unique(rounded_nlh_values))
+          
+          unique_k_values <- foreach(nlh = unique_nlh_values, .combine = c, 
+                                     .packages = c('splines', 'MASS')) %dopar% {
+                                       find_k_factor(nu = nu, norm_lx_h = nlh)
+                                     } #unique value 에 대해 병렬로 k-factor 계산
+          
+          k_lookup_table <- setNames(unique_k_values, unique_nlh_values)
+          
+          k_factors <- k_lookup_table[as.character(rounded_nlh_values)]
+          k_factors <- as.numeric(k_factors)
+    
+          
+          TI_upper <- pred_train + sqrt(est_var) * k_factors
+          TI_lower <- pred_train - sqrt(est_var) * k_factors
+          TI_upper <- TI_upper * sqrt(variance_hat_train)
+          TI_lower <- TI_lower * sqrt(variance_hat_train)
+          
+          # 선형 보간 
+          TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
+          TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
+          interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x)$y
+          interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x)$y
+          
+          coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
+          width <- TI_upper - TI_lower
+          
+          list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
+        }
+      }) #with_progress 끝 
+      # 결과 합치기
+      coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
+      width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
+      test_x <- results_list[[1]]$test_x  # 테스트 x는 같으니까 하나만
+      test_y <- results_list[[1]]$test_y
+      
+      end_time <- Sys.time()
+      duration <- round(difftime(end_time, start_time, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
+      
+      # PICP 계산
+      coverage_probabilities <- rowMeans(coverage_matrix)
+      
+      # NMPIW 계산
+      range_y <- max(test_y) - min(test_y)
+      normalized_width <- width_matrix / range_y
+      nmpiw <- rowMeans(normalized_width)
+      
+      # Mean Width
+      mean_width <- rowMeans(width_matrix)
+      
+      monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+        data.frame(x = sort(test_x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
+    }
+  }
+  
+  return(monte_carlo_results)
+}
+
+seed = 123
+M=500
+models <- c(1, 2, 3, 4)
+sample_sizes <- c(50, 100, 200)
+
+# 결과 저장 
+
+monte_carlo_results <- transform_and_evaluate(models, sample_sizes, M, seed=seed)
+
+
+# 결과를 하나의 데이터프레임으로 정리
+results <- monte_carlo_results
+summary_df <- do.call(rbind, lapply(names(results), function(name) {
+  df <- monte_carlo_results[[name]]
+  df_summary <- data.frame(
+    Model = sub("Model_(\\d+)_.*", "\\1", name),
+    SampleSize = sub("._m_(\\d+)", "\\1", name),
+    PICP = round(mean(df$coverage_probabilities, na.rm=TRUE),4),
+    NMPIW = round(mean(df$NMPIW, na.rm=TRUE),4)
+  )
+  return(df_summary)
+}))
+
+summary_df
+summary_df$SampleSize <- as.integer(gsub("Model_", "", summary_df$SampleSize))
+summary_df$Model <- as.integer(summary_df$Model)
+summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
+
+library(knitr)
+kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW (k 직접 계산) ')
