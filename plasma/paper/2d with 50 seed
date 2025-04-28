@@ -166,7 +166,7 @@ for (s in 1:50) {
   nu <- numerator / denominator
   
   # norm 계산
-  norm_lx_h_values <- apply(S, 1, compute_norm)
+  norm_lx_h_values <- apply(S, 2, compute_norm)
   
   # k-factor 계산 (근사 사용했는지 여부 추가)
   k_results <- mapply(function(nlh, i) {
