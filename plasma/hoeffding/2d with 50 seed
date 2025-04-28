@@ -1,0 +1,161 @@
+library(mgcv)
+library(fields)
+library(MASS)
+# 필요한 함수 정의
+# Hoeffding-style lambda estimation
+find_lambda_hat <- function(alpha=0.95, delta=0.90, y, mean_pred, variance, n, lower=0, upper=5){
+  f <- function(lambda) {
+    risk <- mean(y <= mean_pred - sqrt(variance)*lambda |
+                   y >= mean_pred + sqrt(variance)*lambda, na.rm=TRUE)
+    threshold <- (1 - alpha) - sqrt(log(1/delta) / (2 * n))
+    return(risk - threshold)
+  }
+  tryCatch({
+    uniroot(f, interval = c(lower, upper))$root
+  }, error=function(e){
+    optimize(f, interval = c(lower, upper))$minimum
+  })
+}
+
+# 데이터 불러오기
+data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+
+# 변수 목록
+all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT", 
+              "FIBER", "QUETELET", "RETDIET", "AGE")
+target_y <- data$BETAPLASMA
+
+# 결과 저장
+results_summary <- data.frame()
+
+# 변수 조합 생성 (중복, 자기 자신 제외)
+var_combinations <- combn(all_vars, 2, simplify = FALSE)
+
+# 반복
+for (vars in var_combinations) {
+  x1_name <- vars[1]
+  x2_name <- vars[2]
+  
+  cat(sprintf("\n🔧 현재 조합: x1 = %s, x2 = %s\n", x1_name, x2_name))
+  
+  picp_list <- c()
+  nmpiw_list <- c()
+  time_list <- c()
+  fallback_count_list <- c()
+  
+  for (s in 1:50) {
+    cat(sprintf("  ▶️ Seed %d 시작...\n", s))
+    
+    start_time <- Sys.time()
+    set.seed(s)
+    
+    x1 <- data[[x1_name]]
+    x2 <- data[[x2_name]]
+    y <- target_y
+    
+    # 결측 제거
+    complete_idx <- complete.cases(x1, x2, y)
+    x1 <- x1[complete_idx]; x2 <- x2[complete_idx]; y <- y[complete_idx]
+    
+    n <- length(y)
+    n_train <- 100
+    n_cal <- 100
+    n_test <- n- n_train - n_cal #115
+    
+    all_indices <- sample(seq_len(n))
+    train_idx <- all_indices[1:n_train]
+    cal_idx <- all_indices[(n_train+1):(n_train+n_cal)]
+    test_idx <- all_indices[(n_train+n_cal+1):n]
+    
+    # 데이터 (2d) (with scaling)
+    # train set만으로 평균과 표준편차 추정
+    train_mean_x1 <- mean(x1[train_idx])
+    train_sd_x1   <- sd(x1[train_idx])
+    
+    train_mean_x2 <- mean(x2[train_idx])
+    train_sd_x2   <- sd(x2[train_idx])
+    
+    train_mean_y <- mean(y[train_idx])
+    train_sd_y   <- sd(y[train_idx])
+    
+    # train/cal/test 각각 동일 기준으로 scaling 
+    x1 <- (x1-train_mean_x1) / train_sd_x1
+    x2 <- (x2-train_mean_x2) / train_sd_x2
+    y <- (y - train_mean_y) / train_sd_y
+    
+    train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
+    train_y <- y[train_idx]
+    cal_x <- data.frame(x1=x1[cal_idx], x2 = x2[cal_idx])
+    cal_y <- y[cal_idx]
+    test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx])
+    test_y <- y[test_idx]
+    
+    
+    # 1. Train data 이용해 모델 학습 (평균 예측값 계산)
+    fit <- gam(train_y ~ te(train_x$x1,train_x$x2)) #train으로 만든 평균추정 모델
+    cal_mean_pred <- predict(fit, train_x = cal_x) #cal로 평균예측
+    
+    # 2. Calibration data로 예측 오차의 분산 추정 (log scale)
+    train_res <- train_y - predict(fit, train_x=train_x)
+    log_res2 <- log(train_res^2+1e-8) #log transformation
+    
+    gam_model <- gam(log_res2~te(train_x$x1, train_x$x2)) #train으로 만든 분산추정 모델
+    log_pred <- predict(gam_model, train_x = cal_x) #cal로 분산 예측
+    cal_variance <- exp(log_pred) 
+    
+    # 3. Tolerance Interval 계산 (분산 포함)
+    lambda_hat <- find_lambda_hat(alpha=0.95, delta=0.90, cal_y, cal_mean_pred, cal_variance, length(cal_y))
+    
+    TI_upper <- cal_mean_pred + sqrt(cal_variance) * lambda_hat
+    TI_lower <- cal_mean_pred - sqrt(cal_variance) * lambda_hat
+    
+    
+    # 4. 외삽 보간을 이용 : Thin Plate Spline 모델을 새롭게 생성
+    library(fields)
+    tps_lower <- Tps(x=as.matrix(cal_x), Y=TI_lower)
+    tps_upper <- Tps(x=as.matrix(cal_x), Y=TI_upper) 
+    #----------------#Warning : 모델이 과하게 정규화되어 매끄러운 보간을 한 상태. 일단 안정적인 외삽을 위해 경고 스킵.
+    
+    
+    test_TIlower <- predict(tps_lower, x=as.matrix(test_x))
+    test_TIupper <- predict(tps_upper, x = as.matrix(test_x))
+    
+    cat("선형보간으로 가능한 test 개수:", sum(!is.na(test_TIlower)), "/", length(test_y), "\n") 
+    # test point 모두가 expolation .... 
+    # 그래도 결과가 좋으니 괜찮나? 
+    
+    #5. 결과 출력 (Evaluation)
+    covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
+    widths <- TI_upper - TI_lower #기존 TI 사용 
+    MPIW <- mean(widths)
+    PICP <- mean(covered)
+    NMPIW <- MPIW / (max(test_y) - min(test_y))
+    
+    end_time <- Sys.time()
+    time_elapsed <- as.numeric(end_time - start_time, units = "secs")
+    
+    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, fallback k: %d, 시간: %.2f 초\n",
+                s, PICP, NMPIW, sum(fallback_flags), time_elapsed))
+    picp_list <- c(picp_list, PICP)
+    nmpiw_list <- c(nmpiw_list, NMPIW)
+    time_list <- c(time_list, time_elapsed)
+    fallback_count_list <- c(fallback_count_list, sum(fallback_flags))
+  }
+  
+  # 평균값 저장
+  results_summary <- rbind(results_summary, data.frame(
+    x1 = x1_name,
+    x2 = x2_name,
+    mean_PICP = mean(picp_list),
+    mean_NMPIW = mean(nmpiw_list),
+    mean_time = mean(time_list),
+    total_fallbacks = sum(fallback_count_list),
+    mean_fallbacks_per_run = mean(fallback_count_list)
+  ))
+  
+  cat(sprintf("🟢 조합 완료: %s + %s → 평균 PICP: %.4f | 평균 NMPIW: %.4f | 평균 시간: %.2f초 | 총 fallback: %d개\n",
+              x1_name, x2_name, mean(picp_list), mean(nmpiw_list), mean(time_list), sum(fallback_count_list)))
+  
+}
+
+results_summary
