@@ -1,4 +1,143 @@
 library(splines)
+library(foreach)
+library(doParallel)
+
+
+#  CPU 코어 개수 확인 및 병렬 클러스터 설정
+num_cores <- detectCores() - 1 
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# 1. 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  x <- seq(0, 10, length.out = n)
+  pop <- 3 * cos(x) - 5 * (x / 15)^2
+  if (model == 1) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  }
+  return(data.frame(x = x, y = y, pop = pop))
+}
+
+# 2. 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+# 3. Prop 3.1 내의 확률부분을 계산하는 함수 
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    ncp_value <- min(t^2, 20) # 비중심 모수 값이 너무 커지지 않도록 20으로 제한
+    safe_qchisq <- qchisq(P, df = 1, ncp = ncp_value) 
+    threshold <- (nu * safe_qchisq) / (k^2)
+    probability <- pchisq(threshold, df = nu, lower.tail = FALSE)
+    # 결측치 처리
+    if (is.na(probability) || is.nan(probability)) return(1e-6)
+    return(probability)
+  }, error = function(e) {
+    warning("compute_probability 계산 오류 발생, 근사값 사용")
+    #return(1e-6) 근사값을 따로 출력하지 않도록 설정
+  })
+}
+
+# 4. Prop 3.1 의 적분식을 계산하는 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  chi_prob <- compute_probability(nu, t, P, k, norm_lx_h)
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  return(chi_prob * exp_term)
+}
+
+# 5. Prop 3.1 을 만족하는 k를 찾는 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    integral_result <- tryCatch({
+      integrate(integrand, lower = 0, upper = 100, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    }, error = function(e) {
+      warning("적분 실패")
+      #return(1e-6) 적분에 실패하면 오류 메시지만 출력되도록 설정
+    })
+    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+    return(abs((pi_term * integral_result) - gamma)) # 이 차이가 0에 가까워지는 k factor를 찾고자 함
+  }
+  tryCatch({
+    return(optimize(obj_func, interval = c(0.01, 5))$minimum) # 범위는 0부터 5까지로 설정
+  }, error = function(e) {
+    warning("find_k_factor 계산 실패: 근사값 사용")
+    #return(1) #근사값은 오차항이 정규분포를 따른다는 가정에서만 사용 가능하므로, 근사값은 사용하지 않기로 결정.
+  })
+}
+
+# 6. 데이터 변환 함수 
+transform_function <- function(models, sample_sizes, M, seed) {
+  set.seed(seed)
+  transformed_data_list <- list()
+  raw_data_list <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      transformed_data <- matrix(NA, nrow = m, ncol = M)
+      raw_data <- vector("list", M)
+      
+      # 데이터의 분산을 추정해 추정된 분산으로 데이터를 나누어 transform
+      for (i in 1:M) {
+        data <- generate_data(model, m)
+        x <- data$x
+        y <- data$y
+        fit <- smooth.spline(x = x, y = y, cv = FALSE) #논문 방법과 동일하게 GCV 사용
+        pred_y <- predict(fit, x)$y
+        residuals <- y - pred_y
+        
+        log_variance_fit <- smooth.spline(x = x, y = log(residuals^2 + 1e-6), cv = FALSE)
+        log_variance_hat <- predict(log_variance_fit, x)$y
+        variance_hat <- exp(log_variance_hat)
+        
+        variance_hat[is.nan(variance_hat) | is.infinite(variance_hat)] <- 1e-6
+        transform_y <- y / sqrt(variance_hat)
+        
+        transformed_data[, i] <- transform_y
+        raw_data[[i]] <- data.frame(x = x, y = y, variance_hat = variance_hat)
+      }
+      
+      transformed_data_list[[paste0("Model_", model, "_m_", m)]] <- transformed_data
+      raw_data_list[[paste0("Model_", model, "_m_", m)]] <- raw_data
+    }
+  }
+  
+  return(list(transformed = transformed_data_list, raw = raw_data_list))
+}
+
+# 7. 시각화 함수
+plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw, cwc) {
+  df <- data.frame(
+    x = x, y = y,
+    lower = TI_lower, upper = TI_upper,
+    pred = pred_mean, covered = covered
+  )
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(aes(color = covered), size = 1.5) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
+    geom_line(aes(y = pred), color = "darkgreen", size = 0.7) +
+    labs(
+      title = paste0("TI for ", varname),
+      subtitle = sprintf("PICP=%.3f, NMPIW=%.3f, CWC=%.3f", picp, nmpiw, cwc),
+      x = "x", y = varname
+    ) +
+    theme_minimal(base_size = 11) +
+    scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red"))
+  return(p)
+}
+
+
+
+library(splines)
 library(MASS)
 
 
@@ -13,11 +152,10 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
       cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
       start_time <- Sys.time()
       
-      coverage_matrix <- matrix(0, nrow = m / 2, ncol = M)
-      width_matrix <- matrix(0, nrow = m / 2, ncol = M)
-      
-      for (i in 1:M) {
-        if (i %% 50 == 0) cat(sprintf("  Iteration %d / %d\n", i, M))
+      # 병렬 처리 
+      results_list <- foreach(i = 1:M, .packages=c('splines', 'MASS'),
+                              .export = c("generate_data", "find_k_factor", "compute_probability", "integrand", "compute_norm")
+                              ) %dopar% {
         
         data_i <- generate_data(model, m)
         x <- data_i$x
@@ -34,12 +172,9 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
         
         log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
         variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
-        variance_hat_test <- exp(predict(log_variance_fit, test_x)$y)
-        variance_hat_test[is.na(variance_hat_test) | is.infinite(variance_hat_test)] <- 1e-6
         
         transform_y_train <- train_y / sqrt(variance_hat_train)
         fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
-        pred_test <- predict(fit_trans, test_x)$y
         
         B <- bs(train_x, df = fit_trans$df)
         D <- diff(diag(ncol(B)), differences = 2)
@@ -56,31 +191,45 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
         den <- sum(diag((t(R) %*% R)^2))
         nu <- num / den
         
-        norm_lx_h_train <- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
+        norm_lx_h_values<- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
         k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
         
-        TI_upper <- pred_test + sqrt(est_var) * k_factors
-        TI_lower <- pred_test - sqrt(est_var) * k_factors
-        TI_upper <- TI_upper * sqrt(variance_hat_test)
-        TI_lower <- TI_lower * sqrt(variance_hat_test)
+        TI_upper <- pred_train + sqrt(est_var) * k_factors
+        TI_lower <- pred_train - sqrt(est_var) * k_factors
+        TI_upper <- TI_upper * sqrt(variance_hat_train)
+        TI_lower <- TI_lower * sqrt(variance_hat_train)
         
-        coverage_matrix[, i] <- (test_y >= TI_lower) & (test_y <= TI_upper)
-        width_matrix[, i] <- TI_upper - TI_lower
+        # 선형 보간 
+        TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
+        TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
+        interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x)$y
+        interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x)$y
+        
+        coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
+        width <- TI_upper - TI_lower
+        
+        list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
       }
+      
+      # 결과 합치기
+      coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
+      width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
+      test_x <- results_list[[1]]$test_x  # 테스트 x는 같으니까 하나만
+      test_y <- results_list[[1]]$test_y
       
       end_time <- Sys.time()
       duration <- round(difftime(end_time, start_time, units = "mins"), 2)
       cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
       
-      #PICP
+      # PICP 계산
       coverage_probabilities <- rowMeans(coverage_matrix)
       
-      #NMPIW
+      # NMPIW 계산
       range_y <- max(test_y) - min(test_y)
       normalized_width <- width_matrix / range_y
       nmpiw <- rowMeans(normalized_width)
       
-      #Mean Width
+      # Mean Width
       mean_width <- rowMeans(width_matrix)
       
       monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
@@ -119,4 +268,3 @@ summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
 
 library(knitr)
 kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW')
-
