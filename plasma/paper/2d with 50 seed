@@ -218,3 +218,154 @@ for (s in 1:50) {
 # 결과 통합
 results_df <- do.call(rbind, results)
 results_df
+
+
+
+
+######## 모든 조합 ##########
+library(mgcv)
+library(fields)
+library(MASS)
+
+
+# 데이터 불러오기
+data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+
+# 변수 목록
+all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT", 
+              "FIBER", "QUETELET", "RETDIET", "AGE")
+target_y <- data$BETAPLASMA
+
+# 결과 저장
+results_summary <- data.frame()
+
+# 변수 조합 생성 (중복, 자기 자신 제외)
+var_combinations <- combn(all_vars, 2, simplify = FALSE)
+
+# 반복
+for (vars in var_combinations) {
+  x1_name <- vars[1]
+  x2_name <- vars[2]
+  
+  cat(sprintf("\n🔧 현재 조합: x1 = %s, x2 = %s\n", x1_name, x2_name))
+  
+  picp_list <- c()
+  nmpiw_list <- c()
+  time_list <- c()
+  fallback_count_list <- c()
+  
+  for (s in 1:50) {
+    cat(sprintf("  ▶️ Seed %d 시작...\n", s))
+    
+    start_time <- Sys.time()
+    set.seed(s)
+    
+    x1 <- data[[x1_name]]
+    x2 <- data[[x2_name]]
+    y <- target_y
+    
+    # 결측 제거
+    complete_idx <- complete.cases(x1, x2, y)
+    x1 <- x1[complete_idx]; x2 <- x2[complete_idx]; y <- y[complete_idx]
+    
+    m <- length(y)
+    n_test <- 115
+    n_train <- m - n_test
+    
+    idx <- sample(seq_len(m))
+    train_idx <- idx[1:n_train]
+    test_idx <- idx[(n_train + 1):m]
+    
+    train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
+    raw_train_y <- y[train_idx]
+    test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx])
+    raw_test_y <- y[test_idx]
+    
+    # 평균 추정
+    raw_fit <- gam(raw_train_y ~ te(x1, x2), data = train_x)
+    raw_pred_y <- predict(raw_fit, train_x = train_x)
+    raw_residuals <- raw_train_y - raw_pred_y
+    
+    # 분산 추정
+    log_res2 <- log(raw_residuals^2 + 1e-8)
+    variance_fit <- gam(log_res2 ~ te(x1, x2), data = train_x)
+    var_list <- exp(predict(variance_fit, train_x = train_x))
+    train_y <- raw_train_y / sqrt(var_list)
+    
+    # 평활 추정
+    fit <- gam(train_y ~ te(x1, x2), data = train_x)
+    residuals <- train_y - predict(fit, train_x = train_x)
+    B <- predict(fit, type = "lpmatrix")
+    lambda <- fit$sp[1]
+    D <- diff(diag(ncol(B)), differences = 2)
+    S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
+    S <- B %*% S_inv %*% t(B)
+    I_n <- diag(nrow(S))
+    residual_matrix <- I_n - S
+    
+    estimated_variance <- as.numeric((t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix)))
+    
+    numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+    denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+    nu <- numerator / denominator
+    norm_lx_h_values <- apply(S, 1, function(v) sqrt(sum(v^2)))
+    
+    # k-factor 계산
+    fallback_flags <- c()
+    k_factors <- sapply(norm_lx_h_values, function(nlh) {
+      result <- find_k_factor(nu = nu, norm_lx_h = nlh)
+      fallback_flags <<- c(fallback_flags, result$fallback)
+      return(result$k)
+    })
+    
+    pred_y <- predict(fit, train_x = train_x)
+    TI_upper <- pred_y + k_factors * estimated_variance
+    TI_lower <- pred_y - k_factors * estimated_variance
+    raw_TI_upper <- TI_upper * sqrt(var_list)
+    raw_TI_lower <- TI_lower * sqrt(var_list)
+    
+    # 선형보간
+    sink(tempfile())
+    tps_lower <- Tps(x = as.matrix(train_x), Y = raw_TI_lower)
+    tps_upper <- Tps(x = as.matrix(train_x), Y = raw_TI_upper)
+    sink()
+    
+    test_TIlower <- predict(tps_lower, x = as.matrix(test_x))
+    test_TIupper <- predict(tps_upper, x = as.matrix(test_x))
+    
+    test_y <- raw_test_y
+    covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
+    widths <- raw_TI_upper - raw_TI_lower
+    MPIW <- mean(widths)
+    PICP <- mean(covered)
+    NMPIW <- MPIW / (max(test_y) - min(test_y))
+    
+    end_time <- Sys.time()
+    time_elapsed <- as.numeric(end_time - start_time, units = "secs")
+    
+    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, fallback k: %d, 시간: %.2f 초\n",
+               s, PICP, NMPIW, sum(fallback_flags), time_elapsed))
+    picp_list <- c(picp_list, PICP)
+    nmpiw_list <- c(nmpiw_list, NMPIW)
+    time_list <- c(time_list, time_elapsed)
+    fallback_count_list <- c(fallback_count_list, sum(fallback_flags))
+  }
+  
+  # 평균값 저장
+  results_summary <- rbind(results_summary, data.frame(
+    x1 = x1_name,
+    x2 = x2_name,
+    mean_PICP = mean(picp_list),
+    mean_NMPIW = mean(nmpiw_list),
+    mean_time = mean(time_list),
+    total_fallbacks = sum(fallback_count_list),
+    mean_fallbacks_per_run = mean(fallback_count_list)
+  ))
+  
+  cat(sprintf("🟢 조합 완료: %s + %s → 평균 PICP: %.4f | 평균 NMPIW: %.4f | 평균 시간: %.2f초 | 총 fallback: %d개\n",
+              x1_name, x2_name, mean(picp_list), mean(nmpiw_list), mean(time_list), sum(fallback_count_list)))
+  
+}
+
+results_summary
+
