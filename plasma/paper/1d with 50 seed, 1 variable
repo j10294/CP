@@ -175,7 +175,7 @@ for (s in seeds) {
   
   ### k factor 계산 ###
   # 1. smoothing vector의 norm 계산
-  norm_lx_h_values <- apply(smoother_matrix, 1, compute_norm)
+  norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
   rounded_nlh <- round(norm_lx_h_values, 5)  # float 오차 방지용
   
   # 2. 첫 번째 시드에 대해서만 k-factor 계산
