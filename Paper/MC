@@ -56,7 +56,7 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
         den <- sum(diag((t(R) %*% R)^2))
         nu <- num / den
         
-        norm_lx_h_values <- rep(1, length(test_x))
+        norm_lx_h_train <- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
         k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
         
         TI_upper <- pred_test + sqrt(est_var) * k_factors
