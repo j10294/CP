@@ -6,18 +6,25 @@ library(future)
 library(splines)
 library(MASS)
 
-# 병렬 세팅 (doFuture + future 사용!)
+# 병렬 처리 설정
 plan(multisession, workers = detectCores() - 1)
 registerDoFuture()
+handlers(global = TRUE)
 
+# 🔥 1. k_lookup_global 캐시 설정
+k_lookup_path <- "k_lookup_global.rds"
 
+if (file.exists(k_lookup_path)) {
+  cat("📂 k_lookup_global 캐시 불러오는 중...\n")
+  k_lookup_global <- readRDS(k_lookup_path)
+} else {
+  cat("🆕 새로운 k_lookup_global 캐시 생성\n")
+  k_lookup_global <- new.env()
+}
 
-#  CPU 코어 개수 확인 및 병렬 클러스터 설정
-plan(multisession, workers = detectCores() - 1)
-registerDoFuture()
-handlers(global = TRUE) # progressr 핸들 활성화
+# 🔥 2. 필요한 함수 정의
 
-# 1. 데이터 생성 함수 정의
+# 데이터 생성 함수 정의
 generate_data <- function(model, n) {
   x <- seq(0, 10, length.out = n)
   pop <- 3 * cos(x) - 5 * (x / 15)^2
@@ -36,12 +43,12 @@ generate_data <- function(model, n) {
   return(data.frame(x = x, y = y, pop = pop))
 }
 
-# 2. 벡터의 L2 norm 계산 함수
+# 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
-# 3. Prop 3.1 내의 확률부분을 계산하는 함수 
+# Prop 3.1 내의 확률부분을 계산하는 함수 
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
     q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
@@ -62,7 +69,7 @@ compute_probability <- function(nu, t, P, k, norm_lx_h) {
   })
 }
 
-# 4. Prop 3.1 의 적분식을 계산하는 함수
+# Prop 3.1 의 적분식을 계산하는 함수
 integrand <- function(t, k, nu, P, norm_lx_h) {
   exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
   if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
@@ -132,12 +139,24 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
   })
 }
 
+# 근사로 k factor 계산하는 함수 
 find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
   sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
 }
 
+# k factor 가져오기 (캐시 사용)
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
 
-# 6. 데이터 변환 함수 
+# 데이터 변환 함수 
 transform_function <- function(models, sample_sizes, M, seed) {
   set.seed(seed)
   transformed_data_list <- list()
@@ -176,7 +195,7 @@ transform_function <- function(models, sample_sizes, M, seed) {
   return(list(transformed = transformed_data_list, raw = raw_data_list))
 }
 
-# 7. 시각화 함수
+# 시각화 함수
 plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw, cwc) {
   df <- data.frame(
     x = x, y = y,
@@ -198,13 +217,7 @@ plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp,
 }
 
 
-
-library(splines)
-library(MASS)
-
-
-monte_carlo_results <- list()
-
+# 🔥 3. 메인 함수 (transform and evaluate)
 transform_and_evaluate <- function(models, sample_sizes, M, seed) {
   set.seed(seed)
   monte_carlo_results <- list()
@@ -212,79 +225,71 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
   for (model in models) {
     for (m in sample_sizes) {
       cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
-      start_time <- Sys.time()
-      
-      k_lookup_table <- new.env()
+      start_time_model <- Sys.time()
       
       with_progress({
-        p <- progressor(steps=M)
-      
-        # 병렬 처리 
-        results_list <- foreach(i = 1:M, .packages=c('splines', 'MASS', 'foreach','doParallel'),
-                                .export = c("generate_data", "find_k_factor", "find_upper_bound_t", 
-                                            "find_k_factor_fast", "compute_probability", "integrand", "compute_norm")
-                                ) %dopar% {
+        p <- progressor(steps = M)
+        start_time_loop <- Sys.time()
+        
+        results_list <- foreach(i = 1:M, .packages = c('splines', 'MASS', 'foreach', 'doParallel')) %dopar% {
           
-          p() #progress bar 한 칸 채우기 
-                                  
-                                  
+          # 남은 시간 예측
+          elapsed <- as.numeric(difftime(Sys.time(), start_time_loop, units = "secs"))
+          est_remain_min <- round((elapsed / i * M - elapsed) / 60, 2)
+          p(sprintf("Progress: %d/%d | 예상 남은 시간: %.2f 분", i, M, est_remain_min))
+          
           data_i <- generate_data(model, m)
           x <- data_i$x
           y <- data_i$y
-          pop <- data_i$pop
           
           idx <- sample(1:m, size = m / 2)
           train_x <- x[idx]; train_y <- y[idx]
           test_x <- x[-idx]; test_y <- y[-idx]
           
-          fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+          # smoothing
+          fit <- smooth.spline(train_x, train_y, cv = FALSE)
           pred_train <- predict(fit, train_x)$y
           residuals <- train_y - pred_train
           
-          log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
+          # variance estimate
+          log_variance_fit <- smooth.spline(train_x, log(residuals^2 + 1e-6), cv = FALSE)
           variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
           
+          # transform
           transform_y_train <- train_y / sqrt(variance_hat_train)
-          fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
+          fit_trans <- smooth.spline(train_x, transform_y_train, cv = FALSE)
           
+          # Smoother matrix using QR decomposition
           B <- bs(train_x, df = fit_trans$df)
           D <- diff(diag(ncol(B)), differences = 2)
-          S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+          mat <- t(B) %*% B + fit_trans$lambda * t(D) %*% D
+          qr_mat <- qr(mat)
+          S_inv <- qr.solve(qr_mat)
           S <- B %*% S_inv %*% t(B)
           I_n <- diag(length(train_x))
           R <- I_n - S
           
-          residuals <- transform_y_train - predict(fit_trans, train_x)$y
-          est_var <- (t(residuals) %*% residuals) / sum(diag(t(R) %*% R))
+          # residual variance estimate
+          residuals2 <- transform_y_train - predict(fit_trans, train_x)$y
+          est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
           est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
           
+          # effective degrees of freedom
           num <- sum(diag(t(R) %*% R))^2
           den <- sum(diag((t(R) %*% R)^2))
           nu <- num / den
           
+          # k-factor 계산
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+          k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
           
-          # k factor 계산 
-          norm_lx_h_values <- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
-          rounded_nlh_values <- round(norm_lx_h_values, 2)
-          unique_nlh_values <- sort(unique(rounded_nlh_values))
-          
-          unique_k_values <- foreach(nlh = unique_nlh_values, .combine = c, 
-                                     .packages = c('splines', 'MASS')) %dopar% {
-                                       find_k_factor(nu = nu, norm_lx_h = nlh)
-                                     } #unique value 에 대해 병렬로 k-factor 계산
-          
-          k_lookup_table <- setNames(unique_k_values, unique_nlh_values)
-          
-          k_factors <- k_lookup_table[as.character(rounded_nlh_values)]
-          k_factors <- as.numeric(k_factors)
-    
-          
+          # Tolerance interval
           TI_upper <- pred_train + sqrt(est_var) * k_factors
           TI_lower <- pred_train - sqrt(est_var) * k_factors
           TI_upper <- TI_upper * sqrt(variance_hat_train)
           TI_lower <- TI_lower * sqrt(variance_hat_train)
           
-          # 선형 보간 
+          # interpolation
           TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
           TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
           interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x)$y
@@ -295,32 +300,32 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           
           list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
         }
-      }) #with_progress 끝 
-      # 결과 합치기
+      })
+      
+      # 결과 정리
       coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
       width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
-      test_x <- results_list[[1]]$test_x  # 테스트 x는 같으니까 하나만
+      test_x <- results_list[[1]]$test_x
       test_y <- results_list[[1]]$test_y
       
-      end_time <- Sys.time()
-      duration <- round(difftime(end_time, start_time, units = "mins"), 2)
-      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
-      
-      # PICP 계산
       coverage_probabilities <- rowMeans(coverage_matrix)
-      
-      # NMPIW 계산
       range_y <- max(test_y) - min(test_y)
       normalized_width <- width_matrix / range_y
       nmpiw <- rowMeans(normalized_width)
-      
-      # Mean Width
       mean_width <- rowMeans(width_matrix)
       
       monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
         data.frame(x = sort(test_x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
+      
+      end_time_model <- Sys.time()
+      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
     }
   }
+  
+  # 🔥 캐시 저장
+  cat("💾 k_lookup_global 캐시 저장 중...\n")
+  saveRDS(k_lookup_global, k_lookup_path)
   
   return(monte_carlo_results)
 }
@@ -331,7 +336,7 @@ models <- c(1, 2, 3, 4)
 sample_sizes <- c(50, 100, 200)
 
 # 결과 저장 
-
+monte_carlo_results <- list()
 monte_carlo_results <- transform_and_evaluate(models, sample_sizes, M, seed=seed)
 
 
@@ -355,3 +360,4 @@ summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
 
 library(knitr)
 kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW (k 직접 계산) ')
+
