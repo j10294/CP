@@ -191,7 +191,7 @@ numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
 denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
 nu <- numerator / denominator
 
-norm_lx_h_values
+norm_lx_h_values <- apply(S, 2, compute_norm)
 k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
 cat('k factors : ', k_factors) #대부분 근사값 사용함.
 
