@@ -226,6 +226,21 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
     for (m in sample_sizes) {
       cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
       start_time_model <- Sys.time()
+
+      lambda_list <- numeric(M)   # 🔥 추가: GCV로 구한 lambda 저장할 벡터
+      
+      # 1차 패스: GCV로 각 실험별 lambda 저장
+      for (i in 1:M) {
+        data_i <- generate_data(model, m)
+        x <- data_i$x
+        y <- data_i$y
+        
+        fit <- smooth.spline(x = x, y = y, cv = TRUE)   # 🔥 GCV 적용
+        lambda_list[i] <- fit$lambda   # 🔥 lambda 저장
+      }
+      
+      mean_lambda <- mean(lambda_list)  # 🔥 평균 lambda 계산
+      cat(sprintf("🌟 평균 lambda (Model %d, m=%d): %.5f\n", model, m, mean_lambda))
       
       with_progress({
         p <- progressor(steps = M)
@@ -246,8 +261,8 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           train_x <- x[idx]; train_y <- y[idx]
           test_x <- x[-idx]; test_y <- y[-idx]
           
-          # smoothing
-          fit <- smooth.spline(train_x, train_y, cv = FALSE)
+          # 🔥 평균 lambda를 사용해서 smoothing
+          fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, lambda = mean_lambda)
           pred_train <- predict(fit, train_x)$y
           residuals <- train_y - pred_train
           
