@@ -5,6 +5,8 @@ library(doFuture)
 library(future)
 library(splines)
 library(MASS)
+library(parallel)
+library(doRNG)
 
 # 병렬 처리 설정
 plan(multisession, workers = detectCores() - 1)
@@ -24,24 +26,26 @@ if (file.exists(k_lookup_path)) {
 
 # 🔥 2. 필요한 함수 정의
 
-# 데이터 생성 함수 정의
-generate_data <- function(model, n) {
-  x <- seq(0, 10, length.out = n)
-  pop <- 3 * cos(x) - 5 * (x / 15)^2
+# 데이터 생성 함수 정의 (논문과 동일하게 수정)
+generate_data <- function(model, n){
+  if (model ==1 | model == 3){
+    x <- seq(0,10, length.out=n)
+  } else if (model==2 | model ==4) {
+    x <- seq(-10, 10, length.out=n)
+  }
   if (model == 1) {
     y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
-  }
-  if (model == 2) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
-  }
-  if (model == 3) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
-  }
-  if (model == 4) {
+  } else if (model == 2) {
+    y <- (x / 5)^3 + rnorm(n, mean = 0, sd = 1)
+  } else if (model == 3) {
     y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  } else if (model == 4) {
+    y <- (x / 5)^3 + rt(n, df = 3)
   }
-  return(data.frame(x = x, y = y, pop = pop))
+  
+  return(data.frame(x=x, y=y))
 }
+
 
 # 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
@@ -51,17 +55,19 @@ compute_norm <- function(vector) {
 # Prop 3.1 내의 확률부분을 계산하는 함수 
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
-    lhs <- q_val / ((t * sqrt(5 / nu)) + 1) #이 값이 k^2보다 크면, probability가 0으로 감.
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    if (!is.finite(q_val)) return(0)
     
-    if (lhs <= k^2) {
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    if (!is.finite(lhs)) return(0)
+    
+    if (any(lhs <= k^2)) {
       threshold <- (nu * q_val) / (k^2)
-      probability <- pchisq(threshold, df = nu, lower.tail = FALSE) #probability term
-      
-      if (is.na(probability) || is.nan(probability)) return(1e-6)
+      probability <- pchisq(threshold, df = nu, lower.tail = FALSE)
+      if (!is.finite(probability) || is.na(probability) || is.nan(probability)) return(1e-6)
       return(probability)
     } else {
-      return(0) #이 값이 k^2보다 크면, probability가 0으로 감.
+      return(0)
     }
   }, error = function(e) {
     warning("compute_probability 계산 오류 발생")
@@ -71,12 +77,19 @@ compute_probability <- function(nu, t, P, k, norm_lx_h) {
 
 # Prop 3.1 의 적분식을 계산하는 함수
 integrand <- function(t, k, nu, P, norm_lx_h) {
+  # 예외 처리
+  if (!is.numeric(t) || !is.finite(t) || t <= 0) return(0)
+  if (!is.numeric(norm_lx_h) || norm_lx_h <= 1e-8) return(0)
+  
   exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
-  if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
+  if (!is.finite(exp_term) || exp_term < 1e-10) return(0)
   
   prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  if (!is.finite(prob_term) || prob_term < 1e-10) return(0)
+  
   return(exp_term * prob_term)
 }
+
 
 find_upper_bound_t <- function(k, nu, P) {
   t_seq <- seq(0.01, 100, by = 0.05)  # 탐색 구간
@@ -150,7 +163,7 @@ get_k_factor <- function(nu, norm_lx_h) {
   if (exists(key, envir = k_lookup_global)) {
     return(get(key, envir = k_lookup_global))
   } else {
-    k_value <- find_k_factor(nu, norm_lx_h)
+    k_value <- find_k_factor_fast(nu, norm_lx_h)
     assign(key, k_value, envir = k_lookup_global)
     return(k_value)
   }
@@ -226,7 +239,7 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
     for (m in sample_sizes) {
       cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
       start_time_model <- Sys.time()
-
+      
       lambda_list <- numeric(M)   # 🔥 추가: GCV로 구한 lambda 저장할 벡터
       
       # 1차 패스: GCV로 각 실험별 lambda 저장
@@ -246,7 +259,10 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
         p <- progressor(steps = M)
         start_time_loop <- Sys.time()
         
-        results_list <- foreach(i = 1:M, .packages = c('splines', 'MASS', 'foreach', 'doParallel')) %dopar% {
+        results_list <- foreach(i = 1:M, .packages = c('splines', 'MASS', 'foreach', 'doParallel','progressr'),
+                                .export = c('generate_data', 'compute_norm','compute_probability','find_upper_bound_t','integrand','find_k_factor','get_k_factor', 'find_k_factor_fast','transform_function','plot_ti')) %dorng% {
+          set.seed(i+seed*1000) #중복 방지용 
+          p(sprintf('Seed %d', i))                        
           
           # 남은 시간 예측
           elapsed <- as.numeric(difftime(Sys.time(), start_time_loop, units = "secs"))
@@ -257,9 +273,8 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           x <- data_i$x
           y <- data_i$y
           
-          idx <- sample(1:m, size = m / 2)
-          train_x <- x[idx]; train_y <- y[idx]
-          test_x <- x[-idx]; test_y <- y[-idx]
+          train_x <- x; train_y <- y
+          test_x <- x; test_y <- y
           
           # 🔥 평균 lambda를 사용해서 smoothing
           fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, lambda = mean_lambda)
@@ -302,16 +317,10 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           TI_upper <- TI_upper * sqrt(variance_hat_train)
           TI_lower <- TI_lower * sqrt(variance_hat_train)
           
-          # interpolation
-          TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
-          TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
-          interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x)$y
-          interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x)$y
-          
-          coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
+          coverage <- (test_y >= TI_lower) & (test_y <= TI_upper)
           width <- TI_upper - TI_lower
-
-
+          
+          
           if (i == 1) {
             library(ggplot2)
             
@@ -370,7 +379,7 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
             print(p2)
             dev.off()
           }
-
+          
           list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
         }
       })
@@ -432,5 +441,100 @@ summary_df$Model <- as.integer(summary_df$Model)
 summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
 
 library(knitr)
-kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW (k 직접 계산) ')
+kable(summary_df, caption='Paper 모델 그대로 (k 근사) ')
 
+
+
+
+
+# 전체 모델별, 샘플 사이즈별 plot
+library(ggplot2)
+library(dplyr)
+
+pointwise_coverage_summary <- do.call(rbind, lapply(names(monte_carlo_results), function(name) {
+  df <- monte_carlo_results[[name]]
+  
+  if (!("coverage_probabilities" %in% names(df))) return(NULL)
+  
+  df <- df[!is.na(df$coverage_probabilities), ]  # NA 제거
+  if (nrow(df) == 0) return(NULL)  # 전부 NA면 skip
+  
+  model <- as.integer(sub("Model_(\\d+)_m_.*", "\\1", name))
+  m <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
+  
+  data.frame(
+    Model = model,
+    SampleSize = m,
+    x = df$x,
+    Coverage = df$coverage_probabilities,
+    mean_width = df$mean_width,
+    NMPIW = df$NMPIW
+  )
+}))
+
+picp_nmpiw_summary <- pointwise_coverage_summary %>%
+  group_by(Model, SampleSize) %>%
+  summarise(
+    PICP = round(mean(Coverage, na.rm = TRUE), 3),
+    NMPIW = round(mean(NMPIW, na.rm = TRUE), 3)
+  )
+
+plot_data <- pointwise_coverage_summary %>%
+  left_join(picp_nmpiw_summary, by = c("Model", "SampleSize"))
+
+ggplot(plot_data, aes(x = x, y = Coverage)) +
+  geom_point(color = "blue", size=0.7) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "black", size=1.2) +
+  facet_grid(Model ~ SampleSize,scales='free_x', labeller = label_both) +
+  theme_bw(base_size = 14) +
+  labs(title = "Pointwise Coverage Probability with PICP & NMPIW (Young, 2013)",
+       x = "x",
+       y = "Coverage Probability") +
+  geom_text(data = picp_nmpiw_summary,
+            aes(x = Inf, y = -0.05, label = paste0("PICP=", PICP, "\nNMPIW=", NMPIW)),
+            inherit.aes = FALSE,
+            hjust = 1.1, vjust = 0, size = 3.5, color = "black")
+
+
+
+
+#### find_k_factor VS find_k_factor_fast ####
+# 비교 함수 정의
+compare_k_factors <- function(nu = 100, P = 0.9, gamma = 0.95, n_points = 50, seed = 42) {
+  set.seed(seed)
+  
+  # norm_lx_h 값을 50개 생성 (0.5 ~ 5 사이 균등 분포)
+  norm_lx_h_values <- sort(runif(n_points, min = 0.5, max = 5))
+  
+  # 두 함수 결과 저장
+  k_exact <- numeric(n_points)
+  k_fast  <- numeric(n_points)
+  
+  for (i in seq_along(norm_lx_h_values)) {
+    nlh <- norm_lx_h_values[i]
+    
+    #k_fast[i] <- find_k_factor_fast(nu, nlh, P = P, gamma = gamma) 근사사용~
+    k_fast[i] <- find_k_factor(nu, nlh, P=P, gamma=gamma)
+
+    # tryCatch로 실패 방어
+    k_exact[i] <- tryCatch(
+      find_k_factor(nu, nlh, P = P, gamma = gamma),
+      error = function(e) NA
+    )
+  }
+  
+  # 차이 계산
+  diff_k <- k_exact - k_fast
+  rel_diff <- diff_k / k_exact
+  
+  # 데이터프레임 반환
+  result_df <- data.frame(
+    norm_lx_h = norm_lx_h_values,
+    k_exact = k_exact,
+    k_fast = k_fast,
+    abs_diff = diff_k,
+    rel_diff = rel_diff
+  )
+  
+  return(result_df)
+}
