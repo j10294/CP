@@ -310,7 +310,67 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           
           coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
           width <- TI_upper - TI_lower
-          
+
+
+          if (i == 1) {
+            library(ggplot2)
+            
+            RZ <- residuals2
+            observed <- RZ^2
+            theoretical <- qchisq(ppoints(length(observed)), df = nu)
+            
+            ## 파일명 자동화
+            base_filename <- sprintf("Model%d_m%d_seed%d", model, m, seed)
+            
+            ## (1) QQ plot 저장 (paper, figure 1)
+            png(filename = paste0("qqplot_", base_filename, ".png"), width = 800, height = 600)
+            
+            df_qq <- data.frame(
+              theoretical = theoretical,
+              observed = sort(observed)
+            )
+            
+            p1 <- ggplot(df_qq, aes(x = theoretical, y = observed)) +
+              geom_point(size = 1) +
+              geom_abline(slope = 1, intercept = 0, color = "red", linetype = "solid", size = 1) +
+              labs(
+                title = paste0("QQ Plot: Model ", model, ", m=", m),
+                x = "Theoretical Quantiles (Chi-square)",
+                y = "Observed Squared Residuals"
+              ) +
+              theme_bw(base_size = 14)
+            
+            print(p1)
+            dev.off()
+            
+            ## (2) 히스토그램 + Chi-square density 저장 (paper, figure 2) 
+            png(filename = paste0("hist_chisq_", base_filename, ".png"), width = 800, height = 600)
+            
+            x_vals <- seq(0, max(observed)*1.2, length.out = 1000)
+            theoretical_density <- dchisq(x_vals, df = nu)
+            
+            df_hist <- data.frame(
+              observed = observed
+            )
+            df_theoretical <- data.frame(
+              x = x_vals,
+              density = theoretical_density
+            )
+            
+            p2 <- ggplot(df_hist, aes(x = observed)) +
+              geom_histogram(aes(y = ..density..), bins = 30, fill = "grey80", color = "white") +
+              geom_line(data = df_theoretical, aes(x = x, y = density), color = "red", size = 1.2) +
+              labs(
+                title = paste0("Histogram + Chi-square: Model ", model, ", m=", m),
+                x = "Squared Residuals",
+                y = "Density"
+              ) +
+              theme_bw(base_size = 14)
+            
+            print(p2)
+            dev.off()
+          }
+
           list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
         }
       })
