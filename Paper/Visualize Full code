@@ -36,3 +36,13 @@ plot_figure3 <- function(monte_carlo_results, nominal_coverage = 0.95) {
   return(combined_plot)
 }
 
+
+
+# monte_carlo_results 가 이미 있다고 가정하고
+combined_figure3_plot <- plot_figure3(monte_carlo_results)
+
+# 바로 그리기
+print(combined_figure3_plot)
+
+# 또는 파일로 저장
+ggsave("figure3_all_models.png", combined_figure3_plot, width = 15, height = 10, dpi = 300)
