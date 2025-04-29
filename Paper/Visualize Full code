@@ -1,248 +1,38 @@
-library(splines)
-library(MASS)
 library(ggplot2)
-library(gridExtra)
-# ------------------ 설정 및 데이터 ------------------
-# 1. 데이터 생성 함수 정의
-generate_data <- function(model, n) {
-  x <- seq(0, 10, length.out = n)
-  pop <- 3 * cos(x) - 5 * (x / 15)^2
-  if (model == 1) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
-  }
-  if (model == 2) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
-  }
-  if (model == 3) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
-  }
-  if (model == 4) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
-  }
-  return(data.frame(x = x, y = y, pop = pop))
-}
+library(patchwork)  # 여러 개 그래프 한 번에 묶을때 사용하는 라이브러리
 
 
-# ------------------ 필수 함수들 ------------------
-compute_probability <- function(nu, t, P, k, norm_lx_h) {
-  tryCatch({
-    ncp_value <- min(t^2, 20)
-    safe_qchisq <- qchisq(P, df = 1, ncp = ncp_value) 
-    threshold <- (nu * safe_qchisq) / (k^2)
-    probability <- pchisq(threshold, df = nu, lower.tail = FALSE)
-    if (is.na(probability) || is.nan(probability)) return(1e-6)
-    return(probability)
-  }, error = function(e) {
-    warning("compute_probability 계산 오류 발생")
-  })
-}
+# monte_carlo_results 를 받았다고 가정
 
-integrand <- function(t, k, nu, P, norm_lx_h) {
-  chi_prob <- compute_probability(nu, t, P, k, norm_lx_h)
-  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
-  return(chi_prob * exp_term)
-}
-
-find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
-  obj_func <- function(k) {
-    integral_result <- tryCatch({
-      integrate(integrand, lower = 0, upper = 100, k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
-    }, error = function(e) {
-      warning("적분 실패")
-    })
-    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-    return(abs((pi_term * integral_result) - gamma))
-  }
-  tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 5))$minimum)
-  }, error = function(e) {
-    warning("find_k_factor 계산 실패")
-    return(sqrt(nu*qchisq(p=P, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=m))) 
-  })
-}
-
-transform_function <- function(models, sample_sizes, M, seed) {
-  set.seed(seed)
-  transformed_data_list <- list()
-  raw_data_list <- list()
+# 📣 Figure 3 
+plot_figure3 <- function(monte_carlo_results, nominal_coverage = 0.95) {
   
-  for (model in models) {
-    for (m in sample_sizes) {
-      transformed_data <- matrix(NA, nrow = m, ncol = M)
-      raw_data <- vector("list", M)
-      
-      for (i in 1:M) {
-        data_i <- generate_data(model, m)
-        x <- data_i$x
-        y <- data_i$y
-        fit <- smooth.spline(x = x, y = y, cv = FALSE)
-        pred_y <- predict(fit, x)$y
-        residuals <- y - pred_y
-        
-        log_variance_fit <- smooth.spline(x = x, y = log(residuals^2 + 1e-6), cv = FALSE)
-        log_variance_hat <- predict(log_variance_fit, x)$y
-        variance_hat <- exp(log_variance_hat)
-        variance_hat[is.nan(variance_hat) | is.infinite(variance_hat)] <- 1e-6
-        
-        transform_y <- y / sqrt(variance_hat)
-        transformed_data[, i] <- transform_y
-        raw_data[[i]] <- data.frame(x = x, y = y, variance_hat = variance_hat)
-      }
-      key <- paste0("Model_", model, "_m_", m)
-      transformed_data_list[[key]] <- transformed_data
-      raw_data_list[[key]] <- raw_data
-    }
-  }
-  return(list(transformed = transformed_data_list, raw = raw_data_list))
-}
-
-plot_ti <- function(x, y, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw) {
-  df <- data.frame(
-    x = x, y = y,
-    lower = TI_lower, upper = TI_upper,
-    pred = pred_mean, covered = covered
-  )
-  p <- ggplot(df, aes(x = x, y = y)) +
-    geom_point(aes(color = covered), size = 1.5) +
-    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
-    geom_line(aes(y = pred), color = "darkgreen", size = 0.7) +
-    labs(
-      title = paste0("TI for ", varname),
-      subtitle = sprintf("PICP=%.3f, NMPIW=%.3f", picp, nmpiw),
-      x = "x", y = varname
-    ) +
-    theme_minimal(base_size = 11) +
-    scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red"))
-  return(p)
-}
-
-
-# 수정된 plot_ti
-new_plot_ti <- function(x, y, x_interp, TI_lower, TI_upper, pred_mean, varname, covered, picp, nmpiw){
-  df <- data.frame(x = x, y = y, pred = pred_mean)
-  df_TI <- data.frame(x = x_interp, lower = TI_lower, upper = TI_upper, covered = covered, picp = picp, nmpiw = nmpiw)
+  plot_list <- list()
   
-  # 그래프 생성
-  p <- ggplot() +
-    geom_point(aes(x = x, y = y), data = df, color = "blue") +  # 원본 데이터 포인트
-    geom_ribbon(aes(x=x_interp, ymin = lower, ymax = upper), data = df_TI, fill = "green", alpha = 0.3) +  # Tolerance Interval
-    geom_line(aes(y = pred), data = df, color = "darkgreen", size = 0.7) +  # 예측값 선
-    labs(
-      title = paste("TI for", varname),
-      subtitle = sprintf("PICP=%.3f, NMPIW=%.3f", picp, nmpiw),
-      x = "x",
-      y = varname
-    ) +
-    theme_minimal(base_size = 12)
-  
-  return(p)
-}
-
-# 모델 번호와 샘플 크기 정의
-models <- c(1, 2, 3, 4)  # 모델 1, 2, 3, 4
-sample_sizes <- c(50, 100, 200)  # 샘플 크기 50, 100, 200
-
-# 그래프 저장을 위한 리스트 초기화
-plot_list_all_models <- list()
-
-set.seed(2)
-# 모델과 샘플 크기별로 반복하여 시각화
-for (model_num in models) {
-  for (m in sample_sizes) {
-    cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model_num, m))
+  for (name in names(monte_carlo_results)) {
+    df <- monte_carlo_results[[name]]
     
-    # 데이터 생성
-    data <- generate_data(model_num, m)
-    x <- data$x
-    y <- data$y
+    # 모델, 샘플사이즈 정보 추출
+    model_num <- as.integer(sub("Model_(\\d+)_m_.*", "\\1", name))
+    sample_size <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
     
-    # Train / Test split
-    idx <- sample(1:m, size =m/2)
-    train_x <- x[idx]; train_y <- y[idx]
-    test_x <- x[-idx]; test_y <- y[-idx]
-    
-    # 모델 적합 (Spline 모델)
-    fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
-    pred_train <- predict(fit, train_x)$y
-    residuals <- train_y - pred_train
-    
-    # 잔차로부터 분산 추정
-    log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
-    variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
-    variance_hat_train[is.na(variance_hat_train) | is.infinite(variance_hat_train)] <- 1e-6
-    
-    # 변환된 데이터
-    transform_y_train <- train_y / sqrt(variance_hat_train)
-    fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
-    
-    # k-factor 계산
-    B <- bs(train_x, df = max(fit_trans$df), 3)
-    D <- diff(diag(ncol(B)), differences = 2)
-    S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
-    S <- B %*% S_inv %*% t(B)
-    I_n <- diag(length(train_x))
-    R <- I_n - S
-    
-    residuals <- transform_y_train - predict(fit_trans, train_x)$y
-    est_var <- (t(residuals) %*% residuals) / sum(diag(t(R) %*% R))
-    est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
-    
-    num <- sum(diag(t(R) %*% R))^2
-    den <- sum(diag((t(R) %*% R)^2))
-    nu <- num / den
-    
-    # k-factor 값 계산
-    norm_lx_h_values <- rep(1, length(train_x))
-    k_factors <- sapply(norm_lx_h_values, function(nlh) find_k_factor(nu = nu, norm_lx_h = nlh))
-    
-    # Tolerance Interval 계산
-    TI_upper <- pred_train + c(sqrt(est_var)) * k_factors
-    TI_lower <- pred_train - c(sqrt(est_var)) * k_factors
-    TI_upper <- TI_upper * sqrt(variance_hat_train)
-    TI_lower <- TI_lower * sqrt(variance_hat_train)
-    
-    # 선형 보간 추가
-    TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
-    TI_upper_df <- aggregate(TI_upper ~ train_x , FUN = mean)
-    
-    interp_lower <- approx(train_x, TI_lower, test_x, rule = 2)$y
-    interp_upper <- approx(train_x, TI_upper, test_x, rule = 2)$y
-    
-    covered <- (test_y >= interp_lower) & (test_y <= interp_upper)
-    picp <- mean(covered, na.rm = TRUE)
-    nmpiw <- mean(TI_upper - TI_lower, na.rm = TRUE) / (max(test_y) - min(test_y))
-
-    # 결과 시각화
-    df_TI <- data.frame(
-      x = train_x,
-      lower = TI_lower,
-      upper = TI_upper
-    )
-    
-    df_test <- data.frame(x = test_x, y = test_y, covered = covered)
-  
-    p <- ggplot() +
-      geom_ribbon(data = df_TI, aes(x = x, ymin = lower, ymax = upper), fill = "green", alpha = 0.3) +
-      geom_point(data = df_test, aes(x = x, y = y, color = covered)) +
-      scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+    p <- ggplot(df, aes(x = x, y = coverage_probabilities)) +
+      geom_point(size = 1.2, color = "red") +
+      geom_hline(yintercept = nominal_coverage, linetype = "dashed", color = "black", size = 1) +
+      ylim(0.7, 1) +
       labs(
-        title = paste("Model", model_num, "- Sample size =", m),
-        subtitle = sprintf("PICP = %.3f, NMPIW = %.3f", picp, nmpiw),
-        x = "X", y = "Y"
-      )
+        title = paste0("Model ", model_num, ", Sample Size = ", sample_size),
+        x = "x",
+        y = "Coverage Probability"
+      ) +
+      theme_bw(base_size = 14)
     
-    
-    # 그래프 리스트에 추가
-    plot_list_all_models[[paste0("Model_", model_num, "_m_", m)]] <- p
+    plot_list[[name]] <- p
   }
+  
+  # patchwork 로 grid로 합치기
+  combined_plot <- wrap_plots(plot_list, ncol = 3)  # 3개씩 가로로
+  
+  return(combined_plot)
 }
 
-# 모델별, 샘플 크기별로 생성된 그래프 출력
-for (model_num in models) {
-  plots <- list()
-  for (m in sample_sizes){
-    key <- paste0("Model_", model_num, '_m_', m)
-    plots[[length(plots)+1]] <- plot_list_all_models[[key]]
-  }
-  grid.arrange(grobs=plots, ncol=1, top=paste("Model", model_num))
-}
