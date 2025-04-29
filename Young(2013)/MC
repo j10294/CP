@@ -1,0 +1,118 @@
+# 필요한 패키지
+library(splines)
+library(foreach)
+library(progressr)
+library(doFuture)
+library(future)
+library(MASS)
+
+
+# Guo and Young Simulation model
+generate_data <- function(model, n){
+if (model ==1 | model == 3){
+x <- seq(0,10, length.out=n)
+} else if (model==2 | model ==4) {
+x <- seq(-10, 10, length.out=n)
+}
+
+if (model == 1) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+  } else if (model == 2) {
+    y <- (x / 5)^3 + rnorm(n, mean = 0, sd = 1)
+  } else if (model == 3) {
+    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+  } else if (model == 4) {
+    y <- (x / 5)^3 + rt(n, df = 3)
+  }
+
+  return(data.frame(x=x, y=y))
+  }
+
+  
+  
+# Wilks 방법으로 필요한 r 계산하는 함수
+find_r <- function(n, P = 0.9, alpha = 0.05) {
+  for (r in 0:n) {
+    prob <- sum(dbinom(0:(n - r), n, P))
+    if (prob <= alpha) {
+      return(r)
+    }
+  }
+  warning("r 값을 찾지 못했음 — n 반환")
+  return(n)
+}
+
+# Young 방법으로 transform_and_evaluate 함수
+transform_and_evaluate_young <- function(models, sample_sizes, M, seed, P = 0.9, alpha = 0.05) {
+  set.seed(seed)
+  monte_carlo_results <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      cat(sprintf("\n[START - Young] Model: %d, Sample size: %d\n", model, m))
+      start_time_model <- Sys.time()
+      
+      with_progress({
+        p <- progressor(steps = M)
+        start_time_loop <- Sys.time()
+        
+        results_list <- foreach(i = 1:M, .packages = c('splines', 'MASS', 'foreach', 'doParallel'),.export = c("generate_data") 
+        ) %dopar% {
+          
+          elapsed <- as.numeric(difftime(Sys.time(), start_time_loop, units = "secs"))
+          est_remain_min <- round((elapsed / i * M - elapsed) / 60, 2)
+          p(sprintf("Progress: %d/%d | 예상 남은 시간: %.2f 분", i, M, est_remain_min))
+          
+          # 1. 데이터 생성
+          data_i <- generate_data(model, m)
+          x <- data_i$x
+          y <- data_i$y
+          
+          # 2. full 데이터 smoothing spline fit
+          fit <- smooth.spline(x, y, cv = FALSE)
+          pred_y <- predict(fit, x)$y
+          
+          # 3. residuals 계산
+          residuals <- y - pred_y
+          
+          # 4. residuals 정렬
+          ordered_residuals <- sort(residuals)
+          
+          # 5. r 계산
+          r <- find_r(n = m, P = P, alpha = alpha)
+          
+          # 6. tolerance interval
+          lower_bound <- pred_y + ordered_residuals[r + 1]        # indexing 맞추기 위해 +1
+          upper_bound <- pred_y + ordered_residuals[m - r]
+          
+          # 7. coverage 계산
+          covered <- (y >= lower_bound) & (y <= upper_bound)
+          width <- upper_bound - lower_bound
+          
+          list(coverage = covered, width = width, x = x, y = y)
+        }
+      })
+      
+      # Monte Carlo 결과 정리
+      coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
+      width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
+      x <- results_list[[1]]$x
+      y <- results_list[[1]]$y
+      
+      coverage_probabilities <- rowMeans(coverage_matrix)
+      range_y <- max(y) - min(y)
+      normalized_width <- width_matrix / range_y
+      nmpiw <- rowMeans(normalized_width)
+      mean_width <- rowMeans(width_matrix)
+      
+      monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+        data.frame(x = sort(x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
+      
+      end_time_model <- Sys.time()
+      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+      cat(sprintf("[END - Young] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
+    }
+  }
+  
+  return(monte_carlo_results)
+}
