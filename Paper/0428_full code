@@ -262,9 +262,7 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
           # Smoother matrix using QR decomposition
           B <- bs(train_x, df = fit_trans$df)
           D <- diff(diag(ncol(B)), differences = 2)
-          mat <- t(B) %*% B + fit_trans$lambda * t(D) %*% D
-          qr_mat <- qr(mat)
-          S_inv <- qr.solve(qr_mat)
+          S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
           S <- B %*% S_inv %*% t(B)
           I_n <- diag(length(train_x))
           R <- I_n - S
