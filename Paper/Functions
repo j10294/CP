@@ -21,54 +21,83 @@ generate_data <- function(model, n) {
   return(data.frame(x = x, y = y, pop = pop))
 }
 
-# 2. 벡터의 L2 norm 계산 함수
+# 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
-# 3. Prop 3.1 내의 확률부분을 계산하는 함수 
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    q_val <- qchisq(P, df = 1, ncp = t^2) #qchisq value 설정
-    lhs <- q_val / ((t * sqrt(5 / nu)) + 1) #이 값이 k^2보다 크면, probability가 0으로 감.
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
     
-    if (lhs <= k^2) {
-      threshold <- (nu * q_val) / (k^2)
-      probability <- pchisq(threshold, df = nu, lower.tail = FALSE) #probability term
+    # 벡터 입력 대응
+    out <- numeric(length(q_val))
+    
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      l <- lhs[i]
       
-      if (is.na(probability) || is.nan(probability)) return(1e-6)
-      return(probability)
-    } else {
-      return(0) #이 값이 k^2보다 크면, probability가 0으로 감.
+      # 계산 불가한 경우
+      if (is.nan(q) || is.nan(l) || is.na(q) || is.na(l)) {
+        out[i] <- 0
+        next
+      }
+      
+      if (l <= k^2) {
+        threshold <- (nu * q) / (k^2)
+        if (is.nan(threshold) || is.na(threshold)) {
+          out[i] <- 0
+          next
+        }
+        
+        prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+        if (is.nan(prob) || is.na(prob)) {
+          out[i] <- 1e-6
+        } else {
+          out[i] <- prob
+        }
+      } else {
+        out[i] <- 0
+      }
     }
+    
+    return(out)
   }, error = function(e) {
     warning("compute_probability 계산 오류 발생")
-    return(0)
+    return(rep(0, length(t)))  # t가 벡터면 그 길이에 맞게 0 반환
   })
 }
 
-# 4. Prop 3.1 의 적분식을 계산하는 함수
+
+# 적분 함수
 integrand <- function(t, k, nu, P, norm_lx_h) {
   exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
-  if (exp_term < 1e-5) return(0) #exp term 이 너무 작으면 그냥 0 반환
-  
   prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  
+  if (log(exp_term) < -20) {
+    #cat(sprintf("⚠️ 너무 작은 적분항: log(exp) = %.2f (t = %.4f, k = %.4f)\n",
+                log(exp_term), t, k))
+    return(1e-10)
+  }
+  
   return(exp_term * prob_term)
 }
 
+# upper bound 계산 함수
 find_upper_bound_t <- function(k, nu, P) {
-  t_seq <- seq(0.01, 100, by = 0.05)  # 탐색 구간
+  t_seq <- seq(0.01, 20, by = 0.1)
   valid_t <- sapply(t_seq, function(t) {
     q_val <- qchisq(P, df = 1, ncp = t^2)
     lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
-    return(lhs <= k^2)
+    return(length(lhs) == 1 && !is.na(lhs) && lhs <= k^2)
   })
   
   if (any(valid_t)) {
     return(max(t_seq[valid_t]))
   } else {
-    warning("조건을 만족하는 t가 없음 — fallback to t = 10")
-    return(10)
+    warning("조건을 만족하는 t가 없음 — fallback to t = 15")
+    return(15)
   }
 }
 
@@ -82,43 +111,39 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
     
     if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
       warning("upper_bound가 이상함 → fallback")
-      return(Inf) #upperbound 상한값을 inf로 설정
+      return(1e6)
     }
     
-    result <- tryCatch({
-      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
-                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
-      if (is.na(integral_result) || is.nan(integral_result)) return(Inf)
+    tryCatch({
+      integral_result <- integrate(
+        Vectorize(integrand),   # 함수 벡터화
+        lower = 0, upper = upper_bound,
+        k = k, nu = nu, P = P, norm_lx_h = norm_lx_h
+      )$value
+      
       pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-      error <- abs((pi_term * integral_result) - gamma)
+      final_val <- pi_term * integral_result
+      error <- abs(final_val - gamma)
       
-      cat("  ⏳ k =", round(k, 5), 
-          ", upper bound of t ", upper_bound, 
-          ", integral =", round(pi_term * integral_result, 5), 
-          ", error =", round(error, 5), "\n")
-      
+      cat(sprintf("🧪 [OK] k=%.4f | norm=%.4f | integral=%.3e | final=%.5f | gamma=%.2f | error=%.4f\n",
+                  k, norm_lx_h, integral_result, final_val, gamma, error))
+      return(error)
     }, error = function(e) {
-      warning("적분 실패")
+      cat(sprintf("❌ 적분에서 에러: k=%.4f, norm=%.4f\n", k, norm_lx_h))
+      cat("🔍 이유: ", e$message, "\n")
       return(Inf)
     })
-    
-    return(result)
   }
   
-  
   tryCatch({
-    return(optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)$minimum)
+    out <- optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum
     elapsed <- Sys.time() - start_time
     cat("✅ index =", index, ", 최적 k =", round(out, 5), ", 시간:", round(elapsed, 2), "초\n")
-    
+    return(out)
   }, error = function(e) {
-    warning("k 최적화 실패")
-    #return(sqrt(nu*qchisq(p=0.90, df=1, ncp=norm_lx_h^2)/qchisq(p=1-gamma, df=nu, ncp=0))) # 최적화 실패 시 근사값 사용
+    warning("k 최적화 실패 → fallback 적용됨 (index =", index, ")")
+    return(NA)
   })
-}
-
-find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
-  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
 }
 
 
