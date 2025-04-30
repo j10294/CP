@@ -1,235 +1,174 @@
+
 #-----------------------------------------------------------# 필요한 함수 ##
 # 벡터의 L2 norm 계산 함수
 compute_norm <- function(vector) {
   return(sqrt(sum(vector^2)))
 }
 
-# 확률 계산 함수 (Prop 3.1 내부)
+
+# k factor 가져오기 (캐시 사용)
+k_lookup_global <- new.env()
+
+# 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
 compute_probability <- function(nu, t, P, k, norm_lx_h) {
   tryCatch({
-    q_val <- suppressWarnings(qchisq(P, df = 1, ncp = t^2))
-    if (is.na(q_val) || is.nan(q_val) || is.infinite(q_val)) return(1e-6)
-    
+    q_val <- qchisq(P, df = 1, ncp = t^2)
     lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
-    if (lhs <= k^2) {
-      threshold <- (nu * q_val) / (k^2)
-      prob <- suppressWarnings(pchisq(threshold, df = nu, lower.tail = FALSE))
-      if (is.na(prob) || is.nan(prob) || is.infinite(prob)) return(1e-6)
-      return(prob)
-    } else {
-      return(0)
+    
+    # 벡터 입력 대응
+    out <- numeric(length(q_val))
+    
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      l <- lhs[i]
+      
+      # 계산 불가한 경우
+      if (is.nan(q) || is.nan(l) || is.na(q) || is.na(l)) {
+        out[i] <- 0
+        next
+      }
+      
+      if (l <= k^2) {
+        threshold <- (nu * q) / (k^2)
+        if (is.nan(threshold) || is.na(threshold)) {
+          out[i] <- 0
+          next
+        }
+        
+        prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+        if (is.nan(prob) || is.na(prob)) {
+          out[i] <- 1e-6
+        } else {
+          out[i] <- prob
+        }
+      } else {
+        out[i] <- 0
+      }
     }
+    
+    return(out)
   }, error = function(e) {
     warning("compute_probability 계산 오류 발생")
-    return(1e-6)
+    return(rep(0, length(t)))  # t가 벡터면 그 길이에 맞게 0 반환
   })
 }
 
 
 # 적분 함수
-integrand <- function(t, k, nu, P, norm_lx_h) {
-  # exp_term 계산
-  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
-  exp_term[is.nan(exp_term) | is.infinite(exp_term) | exp_term < 1e-10] <- 0
-  
-  # prob_term 계산 (벡터 t에 대해 반복 적용)
-  prob_term <- sapply(t, function(ti) {
-    compute_probability(nu, ti, P, k, norm_lx_h)
+
+
+# upper bound 계산 함수
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 20, by = 0.1)
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(length(lhs) == 1 && !is.na(lhs) && lhs <= k^2)
   })
   
-  # 결합 및 방어
-  result <- exp_term * prob_term
-  result[is.nan(result) | is.infinite(result)] <- 0
-  return(result)
-}
-
-
-
-find_upper_bound_t <- function(k, nu, P) {
-  t_seq <- seq(0.01, 20, by = 0.01)  # 너무 큰 t는 제거 (적분 범위가 커져서 실패 위험 높아짐)
-  
-  for (t in t_seq) {
-    q_val <- suppressWarnings(qchisq(P, df = 1, ncp = t^2))
-    if (is.na(q_val) || is.nan(q_val) || is.infinite(q_val)) next
-    
-    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
-    if (!is.na(lhs) && lhs <= k^2) {
-      return(t)  # 조건 만족하는 최소의 t 반환
-    }
+  if (any(valid_t)) {
+    return(max(t_seq[valid_t]))
+  } else {
+    warning("조건을 만족하는 t가 없음 — fallback to t = 15")
+    return(15)
   }
-  
-  warning("❌ 조건 만족하는 t를 찾지 못했음 — fallback to t = 10")
-  return(10)
 }
-
-
 
 # k-factor 계산 함수
 find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
+  start_time <- Sys.time()
+  cat("▶️ k-factor 계산 시작: index =", index, "\n")
+  
+  integrand <- function(t, k, nu, P, norm_lx_h) {
+    exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+    prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+    if (log(exp_term) < -20) return(1e-10)
+    return(exp_term * prob_term)
+  }
+  
   obj_func <- function(k) {
     upper_bound <- find_upper_bound_t(k, nu, P)
-    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) return(NA)
     
-    result <- tryCatch({
-      integral_result <- integrate(integrand, lower = 0, upper = upper_bound,
-                                   k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
-      if (is.na(integral_result) || is.nan(integral_result)) return(NA)
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
+      warning("upper_bound가 이상함 → fallback")
+      return(1e6)
+    }
+    
+    tryCatch({
+      integral_result <- integrate(
+        Vectorize(integrand),   # 함수 벡터화
+        lower = 0, upper = upper_bound,
+        k = k, nu = nu, P = P, norm_lx_h = norm_lx_h
+      )$value
+      
       pi_term <- sqrt(2 / (pi * norm_lx_h^2))
-      error <- abs((pi_term * integral_result) - gamma)
+      final_val <- pi_term * integral_result
+      error <- abs(final_val - gamma)
+      
+      #cat(sprintf("🧪 [OK] k=%.4f | norm=%.4f | integral=%.3e | final=%.5f | gamma=%.2f | error=%.4f\n",
+                  #k, norm_lx_h, integral_result, final_val, gamma, error))
       return(error)
-    }, error = function(e) NA)
-    
-    return(result)
+    }, error = function(e) {
+      cat(sprintf("❌ 적분에서 에러: k=%.4f, norm=%.4f\n", k, norm_lx_h))
+      cat("🔍 이유: ", e$message, "\n")
+      return(Inf)
+    })
   }
   
-  opt_result <- tryCatch({
-    optimize(obj_func, interval = c(0.01, 5), tol = 1e-2)
-  }, error = function(e) NULL)
-  
-  if (!is.null(opt_result) &&
-      is.list(opt_result) &&
-      is.numeric(opt_result$objective) &&
-      !is.na(opt_result$objective) &&
-      is.finite(opt_result$objective)) {
-    return(list(k = opt_result$minimum, fallback = FALSE))
-  } else {
-    approx_k <- sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) /
-                       qchisq(p = 1 - gamma, df = nu, ncp = 0))
-    return(list(k = approx_k, fallback = TRUE))
-  }
+  tryCatch({
+    out <- optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum
+    elapsed <- Sys.time() - start_time
+    cat("✅ index =", index, ", 최적 k =", round(out, 5), ", 시간:", round(elapsed, 2), "초\n")
+    return(out)
+  }, error = function(e) {
+    warning("k 최적화 실패 → fallback 적용됨 (index =", index, ")")
+    return(NA)
+  })
 }
 
+
+# k factor 가져오기 (캐시 사용)
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
 
 
 #-----------------------------------------------------------# 필요한 함수 ##
 
+
+
+
+library(splines)
+library(gam)
 library(mgcv)
 library(fields)
+
 library(MASS)
+library(parallel)
+library(progressr)
+library(doRNG)
+library(doFuture)
+library(future)
+library(future.apply)
 
-# 데이터 로드
-data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
-x1 <- data$BETAPLASMA
-x2 <- data$FAT
-y <- data$RETPLASMA
+handlers(global = TRUE)
+plan(multisession, workers = availableCores() - 1)  # 코어 수 자동 설정
 
-# 결과 저장용 리스트
-results <- list()
+registerDoFuture()
 
-# 반복: 시드 1~50
-for (s in 1:50) {
-  start_time <- Sys.time()
-  set.seed(s)
-  m <- length(y)
-  n_test <- 115
-  n_train <- m - n_test
-  
-  idx <- sample(seq_len(m))
-  train_idx <- idx[1:n_train]
-  test_idx <- idx[(n_train+1):m]
-  
-  train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx])
-  raw_train_y <- y[train_idx]
-  test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx])
-  raw_test_y <- y[test_idx]
-  
-  # 평균 추정
-  raw_fit <- gam(raw_train_y ~ te(train_x$x1, train_x$x2))
-  raw_pred_y <- predict(raw_fit, train_x = train_x)
-  raw_residuals <- raw_train_y - raw_pred_y
-  
-  # 분산 추정
-  log_res2 <- log(raw_residuals^2 + 1e-8)
-  variance_fit <- gam(log_res2 ~ te(train_x$x1, train_x$x2))
-  var_list <- exp(predict(variance_fit, train_x = train_x))
-  
-  # 정규화된 y
-  train_y <- raw_train_y / sqrt(var_list)
-  
-  # 평활 추정
-  fit <- gam(train_y ~ te(train_x$x1, train_x$x2))
-  residuals <- train_y - predict(fit, train_x = train_x)
-  
-  B <- predict(fit, type = 'lpmatrix')
-  lambda <- fit$sp[1]
-  D <- diff(diag(ncol(B)), differences = 2)
-  S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
-  S <- B %*% S_inv %*% t(B)
-  I_n <- diag(nrow(S))
-  residual_matrix <- I_n - S
-  
-  estimated_variance <- as.numeric((t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix)))
-  
-  # 자유도 추정
-  numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
-  denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
-  nu <- numerator / denominator
-  
-  # norm 계산
-  norm_lx_h_values <- apply(S, 2, compute_norm)
-  
-  # k-factor 계산 (근사 사용했는지 여부 추가)
-  k_results <- mapply(function(nlh, i) {
-    result <- find_k_factor(nu = nu, norm_lx_h = nlh, index = i)
-    return(result)
-  }, norm_lx_h_values, seq_along(norm_lx_h_values), SIMPLIFY = FALSE)
-  
-  k_factors <- sapply(k_results, function(res) res$k)
-  fallback_flags <- sapply(k_results, function(res) res$fallback)
-  num_fallbacks <- sum(fallback_flags)
-  
-  
-  # TI 계산
-  pred_y <- predict(fit, train_x = train_x)
-  TI_upper <- pred_y + k_factors * estimated_variance
-  TI_lower <- pred_y - k_factors * estimated_variance
-  
-  # 원래 단위로 변환
-  raw_TI_upper <- TI_upper * sqrt(var_list)
-  raw_TI_lower <- TI_lower * sqrt(var_list)
-  
-  # 선형보간
-  # Tps 경고 메시지 제거용 sink
-  sink(tempfile())  # 콘솔 출력을 임시 파일로 보냄
-  tps_lower <- Tps(x = as.matrix(train_x), Y = raw_TI_lower)
-  tps_upper <- Tps(x = as.matrix(train_x), Y = raw_TI_upper)
-  sink()  # 콘솔 출력을 원래대로 복구
-  
-  
-  test_TIlower <- predict(tps_lower, x = as.matrix(test_x))
-  test_TIupper <- predict(tps_upper, x = as.matrix(test_x))
-  
-  # 평가 지표
-  test_y <- raw_test_y
-  covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
-  widths <- raw_TI_upper - raw_TI_lower
-  MPIW <- mean(widths)
-  PICP <- mean(covered)
-  NMPIW <- MPIW / (max(test_y) - min(test_y))
-  
-  results[[s]] <- data.frame(seed = s, PICP = PICP, NMPIW = NMPIW)
-  
-  elapsed <- Sys.time() - start_time
-  cat(sprintf("✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f | 소요시간: %.2f 초 | fallback k: %d개\n",
-              s, PICP, NMPIW, as.numeric(elapsed, units = "secs"), num_fallbacks))
-  
-}
-
-# 결과 통합
-results_df <- do.call(rbind, results)
-results_df
-
-
-
-
-######## 모든 조합 ##########
-library(mgcv)
-library(fields)
-library(MASS)
-
-
-# 데이터 불러오기
-data <- read.csv("/Users/hdmt306/Downloads/plasma.csv")
+getwd()
+data <- read.csv('~/Downloads/plasma.csv')
 
 # 변수 목록
 all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT", 
@@ -237,7 +176,7 @@ all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT",
 target_y <- data$BETAPLASMA
 
 # 결과 저장
-results_summary <- data.frame()
+results <- list()
 
 # 변수 조합 생성 (중복, 자기 자신 제외)
 var_combinations <- combn(all_vars, 2, simplify = FALSE)
@@ -252,7 +191,6 @@ for (vars in var_combinations) {
   picp_list <- c()
   nmpiw_list <- c()
   time_list <- c()
-  fallback_count_list <- c()
   
   for (s in 1:50) {
     cat(sprintf("  ▶️ Seed %d 시작...\n", s))
@@ -267,7 +205,6 @@ for (vars in var_combinations) {
     # 결측 제거
     complete_idx <- complete.cases(x1, x2, y)
     x1 <- x1[complete_idx]; x2 <- x2[complete_idx]; y <- y[complete_idx]
-    
     m <- length(y)
     n_test <- 115
     n_train <- m - n_test
@@ -283,7 +220,7 @@ for (vars in var_combinations) {
     
     # 평균 추정
     raw_fit <- gam(raw_train_y ~ te(x1, x2), data = train_x)
-    raw_pred_y <- predict(raw_fit, train_x = train_x)
+    raw_pred_y <- predict(raw_fit, newdata = train_x)
     raw_residuals <- raw_train_y - raw_pred_y
     
     # 분산 추정
@@ -294,8 +231,8 @@ for (vars in var_combinations) {
     
     # 평활 추정
     fit <- gam(train_y ~ te(x1, x2), data = train_x)
-    residuals <- train_y - predict(fit, train_x = train_x)
-    B <- predict(fit, type = "lpmatrix")
+    residuals <- train_y - predict(fit, newdata = train_x)
+    B <- predict(fit, type = "lpmatrix", newdata=train_x)
     lambda <- fit$sp[1]
     D <- diff(diag(ncol(B)), differences = 2)
     S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
@@ -311,14 +248,11 @@ for (vars in var_combinations) {
     norm_lx_h_values <- apply(S, 1, function(v) sqrt(sum(v^2)))
     
     # k-factor 계산
-    fallback_flags <- c()
     k_factors <- sapply(norm_lx_h_values, function(nlh) {
-      result <- find_k_factor(nu = nu, norm_lx_h = nlh)
-      fallback_flags <<- c(fallback_flags, result$fallback)
-      return(result$k)
+      get_k_factor(nu = nu, norm_lx_h = nlh)
     })
     
-    pred_y <- predict(fit, train_x = train_x)
+    pred_y <- predict(fit, newdata= train_x)
     TI_upper <- pred_y + k_factors * estimated_variance
     TI_lower <- pred_y - k_factors * estimated_variance
     raw_TI_upper <- TI_upper * sqrt(var_list)
@@ -343,12 +277,11 @@ for (vars in var_combinations) {
     end_time <- Sys.time()
     time_elapsed <- as.numeric(end_time - start_time, units = "secs")
     
-    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, fallback k: %d, 시간: %.2f 초\n",
-               s, PICP, NMPIW, sum(fallback_flags), time_elapsed))
+    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, 시간: %.2f 초\n",
+                s, PICP, NMPIW, time_elapsed))
     picp_list <- c(picp_list, PICP)
     nmpiw_list <- c(nmpiw_list, NMPIW)
     time_list <- c(time_list, time_elapsed)
-    fallback_count_list <- c(fallback_count_list, sum(fallback_flags))
   }
   
   # 평균값 저장
@@ -357,15 +290,10 @@ for (vars in var_combinations) {
     x2 = x2_name,
     mean_PICP = mean(picp_list),
     mean_NMPIW = mean(nmpiw_list),
-    mean_time = mean(time_list),
-    total_fallbacks = sum(fallback_count_list),
-    mean_fallbacks_per_run = mean(fallback_count_list)
+    mean_time = mean(time_list)
   ))
   
-  cat(sprintf("🟢 조합 완료: %s + %s → 평균 PICP: %.4f | 평균 NMPIW: %.4f | 평균 시간: %.2f초 | 총 fallback: %d개\n",
-              x1_name, x2_name, mean(picp_list), mean(nmpiw_list), mean(time_list), sum(fallback_count_list)))
+  cat(sprintf("🟢 조합 완료: %s + %s → 평균 PICP: %.4f | 평균 NMPIW: %.4f | 평균 시간: %.2f초\n",
+              x1_name, x2_name, mean(picp_list), mean(nmpiw_list), mean(time_list)))
   
 }
-
-results_summary
-
