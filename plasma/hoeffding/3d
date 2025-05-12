@@ -1,0 +1,168 @@
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
+  f <- function(lambda, alpha, delta, y, pred, variance, n){
+    risk <- mean(y <= pred - sqrt(variance)*lambda |
+                   y >= pred + sqrt(variance)*lambda, na.rm=TRUE)
+    threshold <- (1 - alpha) - sqrt(log(1/delta) / (2*n))
+    return(risk - threshold)
+  }
+  lambda_hat <- tryCatch({
+    uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta,
+            y=y, pred=pred, variance=variance, n=n)$root
+  }, error=function(e){
+    optimize(function(lambda) f(lambda, alpha, delta, y, pred, variance, n),
+             interval = c(lower, upper))$minimum
+  })
+  return(lambda_hat)
+}
+
+# trimmed mean 함수
+trimmed_mean <- function(x, trim_ratio = 0.05) {
+  return(mean(x, trim = trim_ratio))
+}
+
+# 결과 저장
+results_summary_hoeffding <- data.frame(
+  x1 = character(),
+  x2 = character(),
+  x3 = character(),
+  mean_PICP = numeric(),
+  mean_NMPIW = numeric(),  
+  mean_time = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+
+#-----------------------------------------------------------# 필요한 함수 ##
+
+library(splines)
+library(gam)
+library(mgcv)
+library(fields)
+
+library(MASS)
+
+
+data <- read.csv('~/Data/plasma.csv')
+
+# 변수 목록
+all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT", 
+              "FIBER", "QUETELET", "RETDIET", "AGE")
+target_y <- data$BETAPLASMA
+
+# 3차원 변수 조합 생성
+var_combinations <- combn(all_vars, 3, simplify = FALSE)
+
+for (vars in var_combinations) {
+  x1_name <- vars[1]; x2_name <- vars[2]; x3_name <- vars[3]
+  cat(sprintf("\n🔧 현재 조합: x1 = %s, x2 = %s, x3 = %s\n", x1_name, x2_name, x3_name))
+  
+  picp_list <- c(); nmpiw_list <- c(); time_list <- c()
+  
+  for (s in 1:50) {
+    cat(sprintf("  ▶️ Seed %d 시작...\n", s))
+    start_time <- Sys.time()
+    set.seed(s)
+    
+    x1 <- data[[x1_name]]; x2 <- data[[x2_name]]; x3 <- data[[x3_name]]
+    y <- target_y
+    complete_idx <- complete.cases(x1, x2, x3, y)
+    x1 <- x1[complete_idx]; x2 <- x2[complete_idx]; x3 <- x3[complete_idx]; y <- y[complete_idx]
+    
+    n <- length(y)
+    n_train <- 100
+    n_cal <- 100
+    n_test <- n- n_train - n_cal #115
+    
+    all_indices <- sample(seq_len(n))
+    train_idx <- all_indices[1:n_train]
+    cal_idx <- all_indices[(n_train+1):(n_train+n_cal)]
+    test_idx <- all_indices[(n_train+n_cal+1):n]
+    
+    # 데이터 (2d) (with scaling)
+    # train set만으로 평균과 표준편차 추정
+    train_mean_x1 <- mean(x1[train_idx])
+    train_sd_x1   <- sd(x1[train_idx])
+    
+    train_mean_x2 <- mean(x2[train_idx])
+    train_sd_x2   <- sd(x2[train_idx])
+    
+    train_mean_x3 <- mean(x3[train_idx])
+    train_sd_x3 <- sd(x3[train_idx])
+    
+    train_mean_y <- mean(y[train_idx])
+    train_sd_y   <- sd(y[train_idx])
+    
+    # train/cal/test 각각 동일 기준으로 scaling 
+    x1 <- (x1-train_mean_x1) / train_sd_x1
+    x2 <- (x2-train_mean_x2) / train_sd_x2
+    x3 <- (x3-train_mean_x3) / train_sd_x3
+    y <- (y - train_mean_y) / train_sd_y
+    
+    train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx], x3 = x3[train_idx])
+    train_y <- y[train_idx]
+    cal_x <- data.frame(x1=x1[cal_idx], x2 = x2[cal_idx], x3=x3[cal_idx])
+    cal_y <- y[cal_idx]
+    test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx], x3 = x3[test_idx])
+    test_y <- y[test_idx]
+    
+    
+    # 1. Train data 이용해 모델 학습 (평균 예측값 계산)
+    fit <- gam(train_y ~ te(x1, x2, x3, k=c(4,4,4)), data = train_x) #train으로 만든 평균추정 모델
+    cal_mean_pred <- predict(fit, newdata = cal_x) #cal로 평균예측
+    
+    # 2. Calibration data로 예측 오차의 분산 추정 (log scale)
+    train_res <- train_y - predict(fit, newdata=train_x)
+    log_res2 <- log(train_res^2+1e-8) #log transformation
+    
+    gam_model <- gam(log_res2~te(x1,x2,x3, k=c(4,4,4)), data=train_x) #train으로 만든 분산추정 모델
+    log_pred <- predict(gam_model, newdata= cal_x) #cal로 분산 예측
+    cal_variance <- exp(log_pred) 
+    
+    # 3. Tolerance Interval 계산 (분산 포함)
+    lambda_hat <- find_lambda_hat(alpha=0.95, delta=0.90, cal_y, cal_mean_pred, cal_variance, length(cal_y))
+    
+    TI_upper <- cal_mean_pred + sqrt(cal_variance) * lambda_hat
+    TI_lower <- cal_mean_pred - sqrt(cal_variance) * lambda_hat
+    
+    
+    # 4. 외삽 보간을 이용 : Thin Plate Spline 모델을 새롭게 생성
+    library(fields)
+    tps_lower <- gam(TI_lower ~ te(x1, x2, x3, k=c(4,4,4)), data = train_x)
+    tps_upper <- gam(TI_upper ~ te(x1, x2, x3,  k=c(4,4,4)), data = train_x)
+    
+    test_TIlower <- predict(tps_lower, newdata = test_x)
+    test_TIupper <- predict(tps_upper, newdata = test_x)
+    
+    test_y <- test_y
+    covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
+    widths <- TI_upper - TI_lower
+    MPIW <- mean(widths)
+    PICP <- mean(covered)
+    NMPIW <- MPIW / (max(test_y) - min(test_y))
+    
+    time_elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    
+    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, 시간: %.2f 초\n", s, PICP, NMPIW, time_elapsed))
+    picp_list <- c(picp_list, PICP); nmpiw_list <- c(nmpiw_list, NMPIW); time_list <- c(time_list, time_elapsed)
+  }
+  
+  results_summary_hoeffding <- rbind(results_summary_hoeffding, data.frame(
+    x1 = x1_name, x2 = x2_name, x3 = x3_name,
+    mean_PICP = mean(picp_list),
+    mean_NMPIW = trimmed_mean(nmpiw_list),
+    mean_time = mean(time_list)
+  ))
+  
+  
+  cat(sprintf("🟢 조합 완료: %s + %s + %s → 평균 PICP: %.4f | trimmed NMPIW: %.4f | 평균 시간: %.2f초\n",
+              x1_name, x2_name, x3_name,
+              mean(picp_list), trimmed_mean(nmpiw_list), mean(time_list)))
+}
+
+
+library(ggplot2)
+library(dplyr)
+results_summary_hoeffding %>% 
+  mutate(across(c('mean_PICP','mean_NMPIW'), 
+                ~format(round(.x, 4), scientific = FALSE)))
