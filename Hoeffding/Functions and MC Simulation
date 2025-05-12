@@ -49,43 +49,44 @@ M<-500
 results <- data.frame()
 pointwise_cov_list <- list()
 
-
 for (model in models){
   for (n in sample_sizes){
     start_time <- Sys.time()
     
     picp_vec <- numeric(M)
     nmpiw_vec <- numeric(M)
-    coverage_matrix <- matrix(NA, nrow = M, ncol = n/2)
+    coverage_matrix <- matrix(NA, nrow = M, ncol = 1e+6)
     
     for (sim in 1:M){
       set.seed(sim+model*1000+n) #각 실행별로 시드 다르게 설정
-    
+      
       data <- generate_data(model, n)
       
       x <- data$x
       y <- data$y
       
-      m <- nrow(data)
-      n_test <- n/2
-      n_train <- floor(n/4)
-      n_cal <- n - n_test - n_train
-    
+      n_test <- 1e+6 ##test data 개수는 무한히 많게!!
+      n_train <- n/2
+      n_cal <- n/2
+      
       # 데이터 샘플링
       all_indices <- sample(n)
       train_index <- all_indices[1:n_train]
-      cal_index <- all_indices[(n_train + 1):(n_train + n_cal)]
-      test_index <- all_indices[(n_train + n_cal + 1):n]
+      cal_index <- all_indices[(n_train + 1):n]
       
       train_x <- x[train_index]
       train_y <- y[train_index]
       cal_x <- x[cal_index]
       cal_y <- y[cal_index]
-      test_x <- x[test_index]
-      test_y <- y[test_index]
-    
+      
+      # test data 새롭게 생성
+      set.seed(sim+model*10000+n)
+      test_data <- generate_data(model, n_test)
+      test_x <- test_data$x
+      test_y <- test_data$y
+      
       # 1. 훈련 데이터를 이용해 모델 학습 (평균 예측값 계산)
-      fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+      fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, tol=1e-2)
       cal_mean_pred <- predict(fit, cal_x)$y  # mean prediction
       
       # 2. Calibration 데이터로 예측 오차의 분산 추정 (log scale로)
@@ -111,7 +112,7 @@ for (model in models){
       # 선형 보간
       interp_lower <- approx(x = TI_lower_df$cal_x, y = TI_lower_df$TI_lower, xout = test_x)$y
       interp_upper <- approx(x = TI_upper_df$cal_x, y = TI_upper_df$TI_upper, xout = test_x)$y
-    
+      
       # test_x에 대해 예측값이 TI 구간에 포함되었는지 여부 확인
       included <- (test_y >= interp_lower) & (test_y <= interp_upper)
       picp_vec[sim] <- mean(included, na.rm=TRUE)
@@ -156,6 +157,8 @@ result_summary <- results %>%
   ) %>%
   arrange(model, sample_size)
 print(result_summary)
+
+
 
 
 #--------------------------------------------- pointwise 별 coverage 시각화하여 나타내기 
