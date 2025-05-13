@@ -1,25 +1,38 @@
 # hoeffding_simulation_Montecarlo
 library(gam)
 library(dplyr)
-
 #---------------------------------------------필요한 함수 정의 
 generate_data <- function(model, n) {
-  x <- seq(0, 10, length.out = n)
-  pop <- 3 * cos(x) - 5 * (x / 15)^2
+  x <- sort(runif(n, 0, 10)) # x도 랜덤하게 생성
+  base <- 3 * cos(x) - 5 * (x / 15)^2
+  
   if (model == 1) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2))
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2))
   }
   if (model == 2) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rnorm(n, mean = 0, sd = sqrt(2 * x))
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2 * x))
   }
   if (model == 3) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + 4 - rgamma(n, shape = 2, scale = 2)
+    y <- base + 4 - rgamma(n, shape = 2, scale = 2)
   }
   if (model == 4) {
-    y <- 3 * cos(x) - 5 * (x / 15)^2 + rt(n, df = 3)
+    y <- base + rt(n, df = 3)
   }
-  return(data.frame(x = x, y = y, pop = pop))
+  if (model == 5) {
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    y <- base + rnorm(n, mean = 0, sd = sd_x)
+  }
+  if (model == 6) {
+    y <- base + rnorm(n, mean = 0, sd = 1) + abs(rnorm(n, 0, 1))
+  }
+  if (model == 7) {
+    noise <- ifelse(runif(n) < 0.7, rnorm(n, mean = 0, sd = 1), rnorm(n, mean = 0, sd = 3))
+    y <- base + noise
+  }
+  
+  return(data.frame(x = x, y = y))
 }
+
 
 find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
   f <- function(lambda, alpha, delta, y, pred, variance, n){
@@ -39,8 +52,8 @@ find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5
 }
 #------------------------------------------------------------------------------------------------
 # 모델 번호와 샘플 크기 정의
-models<-1:4
-sample_sizes <- c(50, 100, 200)
+models<-1:7
+sample_sizes <- c(50, 100, 200, 500, 1000)
 
 alpha <- 0.95
 delta <- 0.90
@@ -48,6 +61,7 @@ M<-500
 
 results <- data.frame()
 pointwise_cov_list <- list()
+
 
 for (model in models){
   for (n in sample_sizes){
@@ -58,14 +72,14 @@ for (model in models){
     coverage_matrix <- matrix(NA, nrow = M, ncol = 1e+6)
     
     for (sim in 1:M){
-      set.seed(sim+model*1000+n) #각 실행별로 시드 다르게 설정
+      set.seed(sim+model*1000+n) #로 시드 다르게 설정
       
       data <- generate_data(model, n)
       
       x <- data$x
       y <- data$y
       
-      n_test <- 1e+6 ##test data 개수는 무한히 많게!!
+      n_test <- 1e+6
       n_train <- n/2
       n_cal <- n/2
       
@@ -151,13 +165,7 @@ for (model in models){
   }
 }
 
-# 결과 정리해서 출력 
-result_summary <- results %>%
-  mutate(PICP_mean = round(PICP_mean, 4), NMPIW_mean = round(NMPIW_mean, 4)
-  ) %>%
-  arrange(model, sample_size)
-print(result_summary)
-
+summary(results)
 
 
 
@@ -166,30 +174,47 @@ print(result_summary)
 df_pointwise <- do.call(rbind, pointwise_cov_list)
 
 # factor로 정렬
-df_pointwise_filtered <- df_pointwise %>%
-  filter(sample_size %in% c("n = 50", "n = 100", "n = 200")) %>%
+df_pointwise_filtered <- df_pointwise  %>%
   mutate(
     model = as.integer(gsub("Model ", "", model)),
-    sample_size = factor(sample_size, levels = c("n = 50", "n = 100", "n = 200"))
+    sample_size = factor(sample_size, levels = c("n = 50", "n = 100", "n = 200", "n = 500", "n = 1000"))
   )
 
 # 라벨 데이터 정리
 label_df <- results %>%
-  filter(sample_size %in% c(50, 100, 200)) %>%
+  filter(sample_size %in% c(50, 100, 200, 500, 1000)) %>%
   mutate(
     model = model,
-    sample_size = factor(paste0("n = ", sample_size), levels = c("n = 50", "n = 100", "n = 200")),
+    sample_size = factor(paste0("n = ", sample_size), levels = c("n = 50", "n = 100", "n = 200", "n = 500", "n = 1000")),
     label = sprintf("PICP = %.3f\nNMPIW = %.3f", PICP_mean, NMPIW_mean),
     x = 1, y = 0.1
   )
 
+summary(df_pointwise_filtered) #NA exists
+df_clean <- df_pointwise_filtered %>% filter(!is.na(coverage))
 # 시각화
-ggplot(df_pointwise_filtered, aes(x = x, y = coverage)) +
-  geom_line(color = "blue") +
-  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
-  geom_text(data = label_df, aes(x = x, y = y, label = label),
-            inherit.aes = FALSE, size =2.5, hjust = 0) +
-  facet_grid(model ~ sample_size) +
-  labs(title = "Pointwise Coverage Probability with PICP & NMPIW",
-       x = "x", y = "Coverage Probability") +
-  theme_minimal(base_size = 12)
+# 모델 값 추출
+model_list <- unique(df_clean$model)
+
+# 저장용 폴더 생성 (필요시)
+output_dir <- "pointwise_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# 모델별로 플롯 저장
+for (m in model_list) {
+  df_sub <- df_clean %>% filter(model == m)
+  
+  p <- ggplot(df_sub, aes(x = x, y = coverage)) +
+    geom_line(color = "blue") +
+    geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+    facet_wrap(~ sample_size, ncol = 1) +  # 세로로 5개
+    labs(title = paste("Model", m, "- Pointwise Coverage"),
+         x = "x", y = "Coverage Probability") +
+    theme_minimal(base_size = 12)
+  
+  file_name <- paste0(output_dir, "/model_", m, "_coverage.png")
+  ggsave(file_name, plot = p, width = 6, height = 10, dpi = 300)
+  
+  cat(sprintf("✅ 저장 완료: %s\n", file_name))
+}
+
