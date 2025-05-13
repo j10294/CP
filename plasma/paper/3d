@@ -1,0 +1,158 @@
+#-----------------------------------------------------------# 필요한 함수 ##
+# 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+
+# trimmed mean 함수
+trimmed_mean <- function(x, trim_ratio = 0.05) {
+  return(mean(x, trim = trim_ratio))
+}
+
+# 근사로 k factor 계산하는 함수 
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
+# k factor 가져오기 (캐시 사용)
+k_lookup_global <- new.env()
+
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor_fast(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
+
+#-----------------------------------------------------------# 필요한 함수 ##
+
+library(splines)
+library(gam)
+library(mgcv)
+library(fields)
+
+library(MASS)
+
+
+data <- read.csv('~/Data/plasma.csv')
+
+# 변수 목록
+all_vars <- c("BETADIET", "CALORIES", "CHOLESTEROL", "FAT", 
+              "FIBER", "QUETELET", "RETDIET", "AGE")
+target_y <- data$BETAPLASMA
+
+# 결과 저장
+results_summary <- data.frame(
+  x1 = character(),
+  x2 = character(),
+  x3 = character(),
+  mean_PICP = numeric(),
+  mean_NMPIW = numeric(),
+  mean_time = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# 3차원 변수 조합 생성
+var_combinations <- combn(all_vars, 3, simplify = FALSE)
+
+for (vars in var_combinations) {
+  x1_name <- vars[1]; x2_name <- vars[2]; x3_name <- vars[3]
+  cat(sprintf("\n🔧 현재 조합: x1 = %s, x2 = %s, x3 = %s\n", x1_name, x2_name, x3_name))
+  
+  picp_list <- c(); nmpiw_list <- c(); time_list <- c()
+  
+  for (s in 1:50) {
+    cat(sprintf("  ▶️ Seed %d 시작...\n", s))
+    start_time <- Sys.time()
+    set.seed(s)
+    
+    x1 <- data[[x1_name]]; x2 <- data[[x2_name]]; x3 <- data[[x3_name]]
+    y <- target_y
+    complete_idx <- complete.cases(x1, x2, x3, y)
+    x1 <- x1[complete_idx]; x2 <- x2[complete_idx]; x3 <- x3[complete_idx]; y <- y[complete_idx]
+    m <- length(y); n_test <- 115; n_train <- m - n_test
+    
+    idx <- sample(seq_len(m))
+    train_idx <- idx[1:n_train]; test_idx <- idx[(n_train + 1):m]
+    
+    train_x <- data.frame(x1 = x1[train_idx], x2 = x2[train_idx], x3 = x3[train_idx])
+    test_x <- data.frame(x1 = x1[test_idx], x2 = x2[test_idx], x3 = x3[test_idx])
+    raw_train_y <- y[train_idx]; raw_test_y <- y[test_idx]
+    
+    # 평균 추정
+    raw_fit <- gam(raw_train_y ~ te(x1, x2, x3), data = train_x)
+    raw_pred_y <- predict(raw_fit, newdata = train_x)
+    raw_residuals <- raw_train_y - raw_pred_y
+    
+    # 분산 추정
+    log_res2 <- log(raw_residuals^2 + 1e-8)
+    variance_fit <- gam(log_res2 ~ te(x1, x2, x3), data = train_x)
+    var_list <- exp(predict(variance_fit, newdata = train_x))
+    train_y <- raw_train_y / sqrt(var_list)
+    
+    # 평활 추정
+    fit <- gam(train_y ~ te(x1, x2, x3), data = train_x)
+    residuals <- train_y - predict(fit, newdata = train_x)
+    B <- predict(fit, type = "lpmatrix", newdata = train_x)
+    lambda <- fit$sp[1]
+    D <- diff(diag(ncol(B)), differences = 2)
+    S_inv <- ginv(t(B) %*% B + lambda * t(D) %*% D)
+    S <- B %*% S_inv %*% t(B)
+    I_n <- diag(nrow(S))
+    R <- I_n - S
+    
+    est_var <- as.numeric((t(residuals) %*% residuals) / sum(diag(t(R) %*% R)))
+    nu <- sum(diag(t(R) %*% R))^2 / sum(diag((t(R) %*% R)^2))
+    norm_lx_h_values <- apply(S, 2, compute_norm)
+    
+    k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+    
+    pred_y <- predict(fit, newdata = train_x)
+    TI_upper <- pred_y + k_factors * est_var
+    TI_lower <- pred_y - k_factors * est_var
+    raw_TI_upper <- TI_upper * sqrt(var_list)
+    raw_TI_lower <- TI_lower * sqrt(var_list)
+    
+    # 보간
+    tps_lower <- gam(raw_TI_lower ~ te(x1, x2, x3), data = train_x)
+    tps_upper <- gam(raw_TI_upper ~ te(x1, x2, x3), data = train_x)
+    
+    test_TIlower <- predict(tps_lower, newdata = test_x)
+    test_TIupper <- predict(tps_upper, newdata = test_x)
+    
+    test_y <- raw_test_y
+    covered <- (test_y >= test_TIlower) & (test_y <= test_TIupper)
+    widths <- raw_TI_upper - raw_TI_lower
+    MPIW <- mean(widths)
+    PICP <- mean(covered)
+    NMPIW <- MPIW / (max(test_y) - min(test_y))
+    
+    time_elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    
+    cat(sprintf("  ✅ Seed %d 완료 - PICP: %.4f, NMPIW: %.4f, 시간: %.2f 초\n", s, PICP, NMPIW, time_elapsed))
+    picp_list <- c(picp_list, PICP); nmpiw_list <- c(nmpiw_list, NMPIW); time_list <- c(time_list, time_elapsed)
+  }
+  
+  results_summary <- rbind(results_summary, data.frame(
+    x1 = x1_name, x2 = x2_name, x3 = x3_name,
+    mean_PICP = mean(picp_list),
+    mean_NMPIW = mean(nmpiw_list),
+    trimmed_mean_NMPIW = trimmed_mean(nmpiw_list),
+    mean_time = mean(time_list)
+  ))
+  
+  cat(sprintf("🟢 조합 완료: %s + %s + %s → 평균 PICP: %.4f | 평균 NMPIW: %.4f | 평균 시간: %.2f초\n",
+              x1_name, x2_name, x3_name,
+              mean(picp_list), trimmed_mean(nmpiw_list), mean(time_list)))
+}
+
+
+library(ggplot2)
+library(dplyr)
+results_summary %>% 
+  mutate(across(c('mean_PICP','mean_NMPIW'), ~round(.x, 4)))
