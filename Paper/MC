@@ -1,18 +1,76 @@
 library(splines)
 library(foreach)
-library(doParallel)
-
-
-#  CPU 코어 개수 확인 및 병렬 클러스터 설정
-num_cores <- detectCores() - 1 
-cl <- makeCluster(num_cores)
-registerDoParallel(cl)
-
+library(progressr)
+library(doFuture)
+library(future)
+library(splines)
 library(MASS)
+library(parallel)
+library(doRNG)
+
+# 병렬 처리 설정
+plan(multisession, workers = detectCores() - 1)
+registerDoFuture()
+handlers(global = TRUE)
+
+# 🔥 2. 필요한 함수 정의
+
+# 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  x <- sort(runif(n, 0, 10)) # x도 랜덤하게 생성
+  base <- 3 * cos(x) - 5 * (x / 15)^2
+  
+  if (model == 1) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- base + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- base + rt(n, df = 3)
+  }
+  if (model == 5) {
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    y <- base + rnorm(n, mean = 0, sd = sd_x)
+  }
+  if (model == 6) {
+    y <- base + rnorm(n, mean = 0, sd = 1) + abs(rnorm(n, 0, 1))
+  }
+  if (model == 7) {
+    noise <- ifelse(runif(n) < 0.7, rnorm(n, mean = 0, sd = 1), rnorm(n, mean = 0, sd = 3))
+    y <- base + noise
+  }
+  
+  return(data.frame(x = x, y = y))
+}
 
 
-monte_carlo_results <- list()
+# 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
 
+# 근사로 k factor 계산하는 함수 
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
+# k factor 가져오기 (캐시 사용)
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor_fast(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
+
+# 🔥 3. 메인 함수 (transform and evaluate)
 transform_and_evaluate <- function(models, sample_sizes, M, seed) {
   set.seed(seed)
   monte_carlo_results <- list()
@@ -20,115 +78,159 @@ transform_and_evaluate <- function(models, sample_sizes, M, seed) {
   for (model in models) {
     for (m in sample_sizes) {
       cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
-      start_time <- Sys.time()
+      start_time_model <- Sys.time()
       
-      k_lookup_table <- new.env()
+      lambda_list <- numeric(M)   # 🔥 추가: GCV로 구한 lambda 저장할 벡터
       
-      # 병렬 처리 
-      results_list <- foreach(i = 1:M, .packages=c('splines', 'MASS'),
-                              .export = c("generate_data", "find_k_factor", "find_upper_bound_t", 
-                                          "find_k_factor_fast", "compute_probability", "integrand", "compute_norm")
-                              ) %dopar% {
-        
+      # 1차 패스: GCV로 각 실험별 lambda 저장
+      for (i in 1:M) {
         data_i <- generate_data(model, m)
         x <- data_i$x
         y <- data_i$y
-        pop <- data_i$pop
         
-        idx <- sample(1:m, size = m / 2)
-        train_x <- x[idx]; train_y <- y[idx]
-        test_x <- x[-idx]; test_y <- y[-idx]
-        
-        fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
-        pred_train <- predict(fit, train_x)$y
-        residuals <- train_y - pred_train
-        
-        log_variance_fit <- smooth.spline(x = train_x, y = log(residuals^2 + 1e-6), cv = FALSE)
-        variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
-        
-        transform_y_train <- train_y / sqrt(variance_hat_train)
-        fit_trans <- smooth.spline(x = train_x, y = transform_y_train, cv = FALSE)
-        
-        B <- bs(train_x, df = fit_trans$df)
-        D <- diff(diag(ncol(B)), differences = 2)
-        S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
-        S <- B %*% S_inv %*% t(B)
-        I_n <- diag(length(train_x))
-        R <- I_n - S
-        
-        residuals <- transform_y_train - predict(fit_trans, train_x)$y
-        est_var <- (t(residuals) %*% residuals) / sum(diag(t(R) %*% R))
-        est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
-        
-        num <- sum(diag(t(R) %*% R))^2
-        den <- sum(diag((t(R) %*% R)^2))
-        nu <- num / den
-        
-        norm_lx_h_values <- sapply(1:ncol(S), function(j) { sqrt(sum(S[, j]^2)) })
-        
-        k_factors <- sapply(norm_lx_h_values, function(nlh) {
-          rounded_nlh <- round(nlh, 2)
-          key <- as.character(rounded_nlh)
-          if (!exists(key, envir = k_lookup_table)) {
-            k_value <- find_k_factor(nu = nu, norm_lx_h = rounded_nlh)
-            assign(key, k_value, envir = k_lookup_table)
-          }
-          get(key, envir = k_lookup_table)
+        #fit <- smooth.spline(x = x, y = y, cv = TRUE)   # 🔥 GCV 적용
+        #lambda_list[i] <- fit$lambda   # 🔥 lambda 저장
+        # error "smoothing parameter value too extreme " -> 아래와 같이 수정
+        fit <- tryCatch({
+          smooth.spline(x = x, y = y, cv = TRUE)
+        }, error = function(e) {
+          warning(sprintf("⚠️ smoothing 실패: %s", e$message))
+          return(NULL)
         })
         
-        TI_upper <- pred_train + sqrt(est_var) * k_factors
-        TI_lower <- pred_train - sqrt(est_var) * k_factors
-        TI_upper <- TI_upper * sqrt(variance_hat_train)
-        TI_lower <- TI_lower * sqrt(variance_hat_train)
+        if (!is.null(fit) && !is.null(fit$lambda) && is.finite(fit$lambda)) {
+          lambda_list[i] <- fit$lambda
+        } else {
+          lambda_list[i] <- NA
+        }
         
-        # 선형 보간 
-        TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
-        TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
-        interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x)$y
-        interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x)$y
-        
-        coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
-        width <- TI_upper - TI_lower
-        
-        list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
       }
       
-      # 결과 합치기
+      mean_lambda <- mean(lambda_list, na.rm=TRUE)  # 🔥 평균 lambda 계산
+      cat(sprintf("🌟 평균 lambda (Model %d, m=%d): %.5f\n", model, m, mean_lambda))
+      
+      with_progress({
+        p <- progressor(steps = M)
+        start_time_loop <- Sys.time()
+        
+        results_list <- foreach(i = 1:M, .packages = c('splines', 'MASS', 'foreach', 'doParallel','progressr'),
+                                .export = c('generate_data', 'compute_norm','compute_probability','find_upper_bound_t','integrand','find_k_factor','get_k_factor', 'find_k_factor_fast','transform_function','plot_ti')) %dorng% {
+                                  set.seed(i+seed*1000) #중복 방지용 
+                                  p(sprintf('Seed %d', i))                        
+                                  
+                                  # 남은 시간 예측
+                                  elapsed <- as.numeric(difftime(Sys.time(), start_time_loop, units = "secs"))
+                                  est_remain_min <- round((elapsed / i * M - elapsed) / 60, 2)
+                                  p(sprintf("Progress: %d/%d | 예상 남은 시간: %.2f 분", i, M, est_remain_min))
+                                  
+                                  data_i <- generate_data(model, m)
+                                  x <- data_i$x
+                                  y <- data_i$y
+                                  
+                                  train_x <- x; train_y <- y
+                                  
+                                  set.seed(i+seed*10000)
+                                  test_data <- generate_data(model, 1e+6)
+                                  test_x <- test_data$x; test_y <- test_data$y
+                                  
+                                  # 🔥 평균 lambda를 사용해서 smoothing
+                                  fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, lambda = mean_lambda)
+                                  pred_train <- predict(fit, train_x)$y
+                                  residuals <- train_y - pred_train
+                                  
+                                  # variance estimate
+                                  log_variance_fit <- smooth.spline(train_x, log(residuals^2 + 1e-6), cv = FALSE)
+                                  variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
+                                  
+                                  # transform
+                                  transform_y_train <- train_y / sqrt(variance_hat_train)
+                                  fit_trans <- smooth.spline(train_x, transform_y_train, cv = FALSE)
+                                  
+                                  # Smoother matrix using QR decomposition
+                                  B <- bs(train_x, df = fit_trans$df)
+                                  D <- diff(diag(ncol(B)), differences = 2)
+                                  S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+                                  S <- B %*% S_inv %*% t(B)
+                                  I_n <- diag(length(train_x))
+                                  R <- I_n - S
+                                  
+                                  # residual variance estimate
+                                  residuals2 <- transform_y_train - predict(fit_trans, train_x)$y
+                                  est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+                                  est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+                                  
+                                  # effective degrees of freedom
+                                  num <- sum(diag(t(R) %*% R))^2
+                                  den <- sum(diag((t(R) %*% R)^2))
+                                  nu <- num / den
+                                  
+                                  # k-factor 계산
+                                  norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+                                  k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+                                  
+                                  # Tolerance interval
+                                  TI_upper <- pred_train + sqrt(est_var) * k_factors
+                                  TI_lower <- pred_train - sqrt(est_var) * k_factors
+                                  TI_upper <- TI_upper * sqrt(variance_hat_train)
+                                  TI_lower <- TI_lower * sqrt(variance_hat_train)
+                                  
+                                  # 선형 보간!!
+                                  TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
+                                  TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
+                                  
+                                  interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x, rule = 2)$y
+                                  interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x, rule = 2)$y
+                                  
+                                  coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
+                                  width <- TI_upper - TI_lower
+                                  range <- max(test_y) - min(test_y)
+                                  
+                                  list(coverage = coverage, width = width, test_x = test_x, test_y = test_y, range=range)
+                                }
+      })
+      
+      # 결과 정리
       coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
       width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
-      test_x <- results_list[[1]]$test_x  # 테스트 x는 같으니까 하나만
+      test_x <- results_list[[1]]$test_x
       test_y <- results_list[[1]]$test_y
       
-      end_time <- Sys.time()
-      duration <- round(difftime(end_time, start_time, units = "mins"), 2)
-      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
-      
-      # PICP 계산
       coverage_probabilities <- rowMeans(coverage_matrix)
       
-      # NMPIW 계산
-      range_y <- max(test_y) - min(test_y)
-      normalized_width <- width_matrix / range_y
+      range_vector <- unlist(lapply(results_list, function(res) res$range))
+      range_matrix <- matrix(rep(range_vector, each = nrow(width_matrix)), nrow = nrow(width_matrix))
+      normalized_width <- width_matrix / range_matrix
       nmpiw <- rowMeans(normalized_width)
-      
-      # Mean Width
-      mean_width <- rowMeans(width_matrix)
+
       
       monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
         data.frame(x = sort(test_x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
+      
+      end_time_model <- Sys.time()
+      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
     }
   }
+  
+  # 🔥 캐시 저장
+  cat("💾 k_lookup_global 캐시 저장 중...\n")
+  saveRDS(k_lookup_global, k_lookup_path)
   
   return(monte_carlo_results)
 }
 
 seed = 123
 M=500
-models <- c(1, 2, 3, 4)
-sample_sizes <- c(50, 100, 200)
+models <- 1:7
+sample_sizes <- c(50, 100, 200, 500, 1000)
 
 # 결과 저장 
+k_lookup_global <- new.env()
+k_lookup_path <- "k_lookup_global.rds"
+
+monte_carlo_results <- list()
 monte_carlo_results <- transform_and_evaluate(models, sample_sizes, M, seed=seed)
+
 
 # 결과를 하나의 데이터프레임으로 정리
 results <- monte_carlo_results
@@ -149,4 +251,72 @@ summary_df$Model <- as.integer(summary_df$Model)
 summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
 
 library(knitr)
-kable(summary_df, caption='(Paper) 모델별, 샘플 크기별 PICP, NMPIW (k 직접 계산) ')
+kable(summary_df, caption='Paper 모델수정(k근사, test # : 1e+6)')
+
+
+
+
+
+
+
+
+# 전체 모델별, 샘플 사이즈별 plot
+library(ggplot2)
+library(dplyr)
+
+pointwise_coverage_summary <- do.call(rbind, lapply(names(monte_carlo_results), function(name) {
+  df <- monte_carlo_results[[name]]
+  
+  if (!("coverage_probabilities" %in% names(df))) return(NULL)
+  
+  df <- df[!is.na(df$coverage_probabilities), ]  # NA 제거
+  if (nrow(df) == 0) return(NULL)  # 전부 NA면 skip
+  
+  model <- as.integer(sub("Model_(\\d+)_m_.*", "\\1", name))
+  m <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
+  
+  data.frame(
+    Model = model,
+    SampleSize = m,
+    x = df$x,
+    Coverage = df$coverage_probabilities,
+    mean_width = df$mean_width,
+    NMPIW = df$NMPIW
+  )
+}))
+
+picp_nmpiw_summary <- pointwise_coverage_summary %>%
+  group_by(Model, SampleSize) %>%
+  summarise(
+    PICP = round(mean(Coverage, na.rm = TRUE), 3),
+    NMPIW = round(mean(NMPIW, na.rm = TRUE), 3)
+  )
+
+plot_data <- pointwise_coverage_summary %>%
+  left_join(picp_nmpiw_summary, by = c("Model", "SampleSize"))
+
+
+
+# 저장할 디렉토리 설정 (필요시 생성)
+dir.create("picp_plots", showWarnings = FALSE)
+
+# 모델별로 plot 저장
+for (model_id in unique(plot_data$Model)) {
+  plot_i <- plot_data %>%
+    filter(Model == model_id)
+  
+  p <- ggplot(plot_i, aes(x = x, y = Coverage)) +
+    geom_line(color = "blue", alpha = 0.6) +
+    geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
+    facet_wrap(~SampleSize, ncol = 1) +
+    labs(title = paste("Model", model_id, " - Pointwise Coverage (PICP)"),
+         y = "Coverage Probability",
+         x = "x") +
+    ylim(0, 1) +
+    theme_minimal(base_size = 14)
+  
+  ggsave(sprintf("picp_plots/Model_%d_PICP_plot.png", model_id),
+         plot = p, width = 8, height = 12)
+}
+
+
