@@ -73,7 +73,6 @@ get_k_factor <- function(nu, norm_lx_h) {
   }
 }
 
-# 🔥 3. 메인 함수 (transform and evaluate)
 transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
   set.seed(seed)
   monte_carlo_results <- list()
@@ -85,6 +84,7 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
       start_time_model <- Sys.time()
       
       lambda_list <- numeric(M)
+      results_list <- list()
       
       for (i in 1:M) {
         data_i <- generate_data(model, m)
@@ -108,27 +108,22 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
       mean_lambda <- mean(lambda_list, na.rm = TRUE)
       cat(sprintf("🌟 평균 lambda (Model %d, m=%d): %.5f\n", model, m, mean_lambda))
       
-      results_list <- list()
-      
       for (i in 1:M) {
-        #cat(sprintf("🌱 Seed %d 시작 ...\n", i + seed * 1000))
         set.seed(i + seed * 1000)
         data_i <- generate_data(model, m)
-        x <- data_i$x
-        y <- data_i$y
-        
-        train_x <- x; train_y <- y
+        train_x <- data_i$x
+        train_y <- data_i$y
         
         set.seed(i + seed * 10000)
         test_data <- generate_data(model, m)
-        test_x <- test_data$x; test_y <- test_data$y
+        test_x <- test_data$x
+        test_y <- test_data$y
         
         fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, lambda = mean_lambda)
         pred_train <- predict(fit, train_x)$y
-        if (model %in% c(2,5,8)){
-          
+        
+        if (model %in% c(2, 5, 8)) {
           residuals <- train_y - pred_train
-          
           log_variance_fit <- smooth.spline(train_x, log(residuals^2 + 1e-6), cv = FALSE)
           variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
           
@@ -182,12 +177,7 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
         
         covered <- (test_y >= TI_lower) & (test_y <= TI_upper)
         coverage_rate <- mean(covered)
-      
-        
-        # 90% 이상 커버했는지 여부 기록
         is_covered <- coverage_rate >= 0.90
-        
-        width <- TI_upper - TI_lower
         
         results_list[[i]] <- list(
           is_covered = is_covered,
@@ -196,47 +186,46 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
           NMPIW = mean((TI_upper - TI_lower) / (max(test_y) - min(test_y)))
         )
       }
-      }
       
-    # 평균 Coverage, 너비 등 저장
-    empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
-    mean_width <- mean(sapply(results_list, function(res) res$mean_width))
-    nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
-    
-    monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
-      data.frame(
-        Model = model,
-        SampleSize = m,
-        EmpiricalCoverage = empirical_coverage,
-        MeanWidth = mean_width,
-        NMPIW = nmpiw
+      # ⏬ 루프 끝난 후 여기서 저장!
+      empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
+      mean_width <- mean(sapply(results_list, function(res) res$mean_width))
+      nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
+      
+      monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+        data.frame(
+          Model = model,
+          SampleSize = m,
+          EmpiricalCoverage = empirical_coverage,
+          MeanWidth = mean_width,
+          NMPIW = nmpiw
+        )
+      
+      pointwise_coverage_mean <- Reduce("+", lapply(results_list, function(res) res$pointwise_covered)) / M
+      fixed_x <- seq(0, 10, length.out = m)
+      
+      pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
+        x = fixed_x,
+        coverage = pointwise_coverage_mean
       )
-    
-    # ✅ Pointwise Coverage 평균 저장 (길이 m)
-    pointwise_coverage_mean <- Reduce("+", lapply(results_list, function(res) res$pointwise_covered)) / M
-    
-    # ✅ 기준 x: 항상 동일하게 고정 (train_x를 고정 생성했을 경우에만)
-    fixed_x <- seq(0, 10, length.out = m)
-    
-    pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
-      x = fixed_x,
-      coverage = pointwise_coverage_mean
-    )
-    
-    # 시간 측정
-    end_time_model <- Sys.time()
-    duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
-    cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
+      
+      end_time_model <- Sys.time()
+      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
+    }
   }
+  
   cat("💾 k_lookup_global 캐시 저장 중...\n")
   saveRDS(k_lookup_global, k_lookup_path)
+  
   return(list(
     monte_carlo_results = monte_carlo_results,
     pointwise_coverage_result = pointwise_coverage_result
   ))
 }
 
-seed = 123
+
+seed=123
 M=500
 models <- 1:8
 sample_sizes <- c(50, 100, 200, 500, 1000)
