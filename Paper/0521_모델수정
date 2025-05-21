@@ -160,26 +160,34 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
         interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x, rule = 2)$y
         interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x, rule = 2)$y
         
-        coverage <- (test_y >= interp_lower) & (test_y <= interp_upper)
-        width <- TI_upper - TI_lower
+        # ✅ TI 범위 계산된 이후 test 데이터와 비교
+        covered <- (test_y >= interp_lower) & (test_y <= interp_upper)
+        coverage_rate <- mean(covered)
+
+        # 90% 이상 커버했는지 여부 기록
+        is_covered <- coverage_rate >= 0.90
         
-        results_list[[i]] <- list(coverage = coverage, width = width, test_x = test_x, test_y = test_y)
-      }
+        # 시뮬 결과 저장
+        results_list[[i]] <- list(
+          is_covered = is_covered,
+          mean_width = mean(TI_upper - TI_lower),
+          NMPIW = mean((TI_upper - TI_lower) / (max(test_y) - min(test_y)))
+        )
       
-      coverage_matrix <- do.call(cbind, lapply(results_list, function(res) res$coverage))
-      width_matrix <- do.call(cbind, lapply(results_list, function(res) res$width))
-      test_x <- results_list[[1]]$test_x
-      test_y <- results_list[[1]]$test_y
-      
-      coverage_probabilities <- rowMeans(coverage_matrix)
-      range_y <- max(test_y) - min(test_y)
-      normalized_width <- width_matrix / range_y
-      nmpiw <- rowMeans(normalized_width)
-      mean_width <- rowMeans(width_matrix)
+      # 요약 결과 계산
+      empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
+      mean_width <- mean(sapply(results_list, function(res) res$mean_width))
+      nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
       
       monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
-        data.frame(x = sort(test_x), coverage_probabilities = coverage_probabilities, mean_width = mean_width, NMPIW = nmpiw)
-      
+        data.frame(
+          Model = model,
+          SampleSize = m,
+          EmpiricalCoverage = empirical_coverage,
+          MeanWidth = mean_width,
+          NMPIW = nmpiw
+        )
+
       end_time_model <- Sys.time()
       duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
       cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
