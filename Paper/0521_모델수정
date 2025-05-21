@@ -230,9 +230,11 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
   }
   cat("💾 k_lookup_global 캐시 저장 중...\n")
   saveRDS(k_lookup_global, k_lookup_path)
-  return(monte_carlo_results)
+  return(list(
+    monte_carlo_results = monte_carlo_results,
+    pointwise_coverage_result = pointwise_coverage_result
+  ))
 }
-
 
 seed = 123
 M=500
@@ -244,8 +246,11 @@ k_lookup_global <- new.env()
 k_lookup_path <- "k_lookup_global.rds"
 
 monte_carlo_results <- list()
-monte_carlo_results <- transform_and_evaluate_sequential(models, sample_sizes, M, seed=seed)
+pointwise_coveraage_result <- list()
+results <- transform_and_evaluate_sequential(models, sample_sizes, M, seed=seed)
 
+monte_carlo_results <- results$monte_carlo_results
+pointwise_coverage_result <- results$pointwise_coverage_result
 
 summary_df <- do.call(rbind, lapply(names(monte_carlo_results), function(name) {
   df <- monte_carlo_results[[name]]
