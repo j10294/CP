@@ -77,6 +77,7 @@ get_k_factor <- function(nu, norm_lx_h) {
 transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
   set.seed(seed)
   monte_carlo_results <- list()
+  pointwise_coverage_result <- list()
   
   for (model in models) {
     for (m in sample_sizes) {
@@ -226,15 +227,13 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
     end_time_model <- Sys.time()
     duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
     cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
-    
-    
-    cat("💾 k_lookup_global 캐시 저장 중...\n")
-    saveRDS(k_lookup_global, k_lookup_path)
-    
-    return(monte_carlo_results)
   }
+  cat("💾 k_lookup_global 캐시 저장 중...\n")
+  saveRDS(k_lookup_global, k_lookup_path)
+  return(monte_carlo_results)
 }
-  
+
+
 seed = 123
 M=500
 models <- 1:8
