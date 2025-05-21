@@ -173,25 +173,27 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
           mean_width = mean(TI_upper - TI_lower),
           NMPIW = mean((TI_upper - TI_lower) / (max(test_y) - min(test_y)))
         )
-      
-      # 요약 결과 계산
-      empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
-      mean_width <- mean(sapply(results_list, function(res) res$mean_width))
-      nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
-      
-      monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
-        data.frame(
-          Model = model,
-          SampleSize = m,
-          EmpiricalCoverage = empirical_coverage,
-          MeanWidth = mean_width,
-          NMPIW = nmpiw
-        )
+}
 
-      end_time_model <- Sys.time()
-      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
-      cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
-    }
+      
+    # 요약 결과 계산
+    empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
+    mean_width <- mean(sapply(results_list, function(res) res$mean_width))
+    nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
+    
+    monte_carlo_results[[paste0("Model_", model, "_m_", m)]] <- 
+      data.frame(
+        Model = model,
+        SampleSize = m,
+        EmpiricalCoverage = empirical_coverage,
+        MeanWidth = mean_width,
+        NMPIW = nmpiw
+      )
+
+    end_time_model <- Sys.time()
+    duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+    cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
+
   }
   
   cat("💾 k_lookup_global 캐시 저장 중...\n")
