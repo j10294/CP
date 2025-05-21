@@ -1,3 +1,4 @@
+#### 교수님 답장 받고 전부 다시짜기 ####
 library(splines)
 library(foreach)
 library(progressr)
@@ -118,65 +119,85 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
         train_x <- x; train_y <- y
         
         set.seed(i + seed * 10000)
-        test_data <- generate_data(model, 1e+6)
+        test_data <- generate_data(model, m)
         test_x <- test_data$x; test_y <- test_data$y
         
         fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, lambda = mean_lambda)
         pred_train <- predict(fit, train_x)$y
-        residuals <- train_y - pred_train
+        if (model %in% c(2,5,8)){
+          
+          residuals <- train_y - pred_train
+          
+          log_variance_fit <- smooth.spline(train_x, log(residuals^2 + 1e-6), cv = FALSE)
+          variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
+          
+          transform_y_train <- train_y / sqrt(variance_hat_train)
+          fit_trans <- smooth.spline(train_x, transform_y_train, cv = FALSE)
+          
+          B <- bs(train_x, df = fit_trans$df)
+          D <- diff(diag(ncol(B)), differences = 2)
+          S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+          S <- B %*% S_inv %*% t(B)
+          I_n <- diag(length(train_x))
+          R <- I_n - S
+          
+          residuals2 <- transform_y_train - predict(fit_trans, train_x)$y
+          est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+          est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+          
+          num <- sum(diag(t(R) %*% R))^2
+          den <- sum(diag((t(R) %*% R)^2))
+          nu <- num / den
+          
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+          k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+          
+          TI_upper <- pred_train + sqrt(est_var) * k_factors
+          TI_lower <- pred_train - sqrt(est_var) * k_factors
+          TI_upper <- TI_upper * sqrt(variance_hat_train)
+          TI_lower <- TI_lower * sqrt(variance_hat_train)
+        } else {
+          B <- bs(train_x, df = fit$df)
+          D <- diff(diag(ncol(B)), differences = 2)
+          S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+          S <- B %*% S_inv %*% t(B)
+          I_n <- diag(length(train_x))
+          R <- I_n - S
+          
+          residuals2 <- train_y - predict(fit, train_x)$y
+          est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+          est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+          
+          num <- sum(diag(t(R) %*% R))^2
+          den <- sum(diag((t(R) %*% R)^2))
+          nu <- num / den
+          
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+          k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+          
+          TI_upper <- pred_train + sqrt(est_var) * k_factors
+          TI_lower <- pred_train - sqrt(est_var) * k_factors
+        }
         
-        log_variance_fit <- smooth.spline(train_x, log(residuals^2 + 1e-6), cv = FALSE)
-        variance_hat_train <- exp(predict(log_variance_fit, train_x)$y)
-        
-        transform_y_train <- train_y / sqrt(variance_hat_train)
-        fit_trans <- smooth.spline(train_x, transform_y_train, cv = FALSE)
-        
-        B <- bs(train_x, df = fit_trans$df)
-        D <- diff(diag(ncol(B)), differences = 2)
-        S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
-        S <- B %*% S_inv %*% t(B)
-        I_n <- diag(length(train_x))
-        R <- I_n - S
-        
-        residuals2 <- transform_y_train - predict(fit_trans, train_x)$y
-        est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
-        est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
-        
-        num <- sum(diag(t(R) %*% R))^2
-        den <- sum(diag((t(R) %*% R)^2))
-        nu <- num / den
-        
-        norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
-        k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
-        
-        TI_upper <- pred_train + sqrt(est_var) * k_factors
-        TI_lower <- pred_train - sqrt(est_var) * k_factors
-        TI_upper <- TI_upper * sqrt(variance_hat_train)
-        TI_lower <- TI_lower * sqrt(variance_hat_train)
-        
-        TI_lower_df <- aggregate(TI_lower ~ train_x, FUN = mean)
-        TI_upper_df <- aggregate(TI_upper ~ train_x, FUN = mean)
-        
-        interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$TI_lower, xout = test_x, rule = 2)$y
-        interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$TI_upper, xout = test_x, rule = 2)$y
-        
-        # ✅ TI 범위 계산된 이후 test 데이터와 비교
-        covered <- (test_y >= interp_lower) & (test_y <= interp_upper)
+        covered <- (test_y >= TI_lower) & (test_y <= TI_upper)
         coverage_rate <- mean(covered)
-
+      
+        
         # 90% 이상 커버했는지 여부 기록
         is_covered <- coverage_rate >= 0.90
         
-        # 시뮬 결과 저장
+        width <- TI_upper - TI_lower
+        
         results_list[[i]] <- list(
           is_covered = is_covered,
+          pointwise_covered = as.numeric(covered),
           mean_width = mean(TI_upper - TI_lower),
           NMPIW = mean((TI_upper - TI_lower) / (max(test_y) - min(test_y)))
         )
-}
-
+      }
+      }
       
-    # 요약 결과 계산
+    # 평균 Coverage, 너비 등 저장
     empirical_coverage <- mean(sapply(results_list, function(res) res$is_covered))
     mean_width <- mean(sapply(results_list, function(res) res$mean_width))
     nmpiw <- mean(sapply(results_list, function(res) res$NMPIW))
@@ -189,19 +210,31 @@ transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed) {
         MeanWidth = mean_width,
         NMPIW = nmpiw
       )
-
+    
+    # ✅ Pointwise Coverage 평균 저장 (길이 m)
+    pointwise_coverage_mean <- Reduce("+", lapply(results_list, function(res) res$pointwise_covered)) / M
+    
+    # ✅ 기준 x: 항상 동일하게 고정 (train_x를 고정 생성했을 경우에만)
+    fixed_x <- seq(0, 10, length.out = m)
+    
+    pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
+      x = fixed_x,
+      coverage = pointwise_coverage_mean
+    )
+    
+    # 시간 측정
     end_time_model <- Sys.time()
     duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
-    cat(sprintf("[END] Model: %d, Sample size: %d — %.2f minutes\n", model, m, duration))
-
+    cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
+    
+    
+    cat("💾 k_lookup_global 캐시 저장 중...\n")
+    saveRDS(k_lookup_global, k_lookup_path)
+    
+    return(monte_carlo_results)
   }
-  
-  cat("💾 k_lookup_global 캐시 저장 중...\n")
-  saveRDS(k_lookup_global, k_lookup_path)
-  
-  return(monte_carlo_results)
 }
-
+  
 seed = 123
 M=500
 models <- 1:8
@@ -215,89 +248,49 @@ monte_carlo_results <- list()
 monte_carlo_results <- transform_and_evaluate_sequential(models, sample_sizes, M, seed=seed)
 
 
-# 결과를 하나의 데이터프레임으로 정리
-results <- monte_carlo_results
-summary_df <- do.call(rbind, lapply(names(results), function(name) {
+summary_df <- do.call(rbind, lapply(names(monte_carlo_results), function(name) {
   df <- monte_carlo_results[[name]]
-  df_summary <- data.frame(
-    Model = sub("Model_(\\d+)_.*", "\\1", name),
-    SampleSize = sub("._m_(\\d+)", "\\1", name),
-    PICP = round(mean(df$coverage_probabilities, na.rm=TRUE),4),
-    NMPIW = round(mean(df$NMPIW, na.rm=TRUE),4)
+  
+  data.frame(
+    Model = as.integer(sub("Model_(\\d+)_.*", "\\1", name)),
+    SampleSize = as.integer(sub(".*_m_(\\d+)", "\\1", name)),
+    EmpiricalCoverage = round(df$EmpiricalCoverage, 4),
+    MeanWidth = round(df$MeanWidth, 4),
+    NMPIW = round(df$NMPIW, 4)
   )
-  return(df_summary)
 }))
 
-write.csv(summary_df, "0514_paper_simulation_result.csv", row.names = FALSE)
-
-
-summary_df
-summary_df$SampleSize <- as.integer(gsub("Model_", "", summary_df$SampleSize))
-summary_df$Model <- as.integer(summary_df$Model)
 summary_df <- summary_df[order(summary_df$Model, summary_df$SampleSize), ]
 
-library(knitr)
-kable(summary_df, caption='Paper 모델수정(k근사, test # : 1e+6)')
+write.csv(summary_df, "0521_final_paper_summary.csv", row.names = FALSE)
 
 
 
 
 
-# 전체 모델별, 샘플 사이즈별 plot
 library(ggplot2)
 library(dplyr)
 
-pointwise_coverage_summary <- do.call(rbind, lapply(names(monte_carlo_results), function(name) {
-  df <- monte_carlo_results[[name]]
-  
-  if (!("coverage_probabilities" %in% names(df))) return(NULL)
-  
-  df <- df[!is.na(df$coverage_probabilities), ]  # NA 제거
-  if (nrow(df) == 0) return(NULL)  # 전부 NA면 skip
+# 저장 디렉토리 생성
+dir.create("final_paper_pointwise_plots", showWarnings = FALSE)
+
+# 모든 모델에 대해 pointwise plot 생성
+for (name in names(pointwise_coverage_result)) {
+  df <- pointwise_coverage_result[[name]]
   
   model <- as.integer(sub("Model_(\\d+)_m_.*", "\\1", name))
   m <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
   
-  data.frame(
-    Model = model,
-    SampleSize = m,
-    x = df$x,
-    Coverage = df$coverage_probabilities,
-    mean_width = df$mean_width,
-    NMPIW = df$NMPIW
-  )
-}))
-
-picp_nmpiw_summary <- pointwise_coverage_summary %>%
-  group_by(Model, SampleSize) %>%
-  summarise(
-    PICP = round(mean(Coverage, na.rm = TRUE), 3),
-    NMPIW = round(mean(NMPIW, na.rm = TRUE), 3)
-  )
-
-plot_data <- pointwise_coverage_summary %>%
-  left_join(picp_nmpiw_summary, by = c("Model", "SampleSize"))
-
-
-
-# 저장할 디렉토리 설정 (필요시 생성)
-dir.create("paper_picp_plots", showWarnings = FALSE)
-
-# 모델별로 plot 저장
-for (model_id in unique(plot_data$Model)) {
-  plot_i <- plot_data %>%
-    filter(Model == model_id)
-  
-  p <- ggplot(plot_i, aes(x = x, y = Coverage)) +
-    geom_line(color = "blue", alpha = 0.6) +
+  p <- ggplot(df, aes(x = x, y = coverage)) +
+    geom_line(color = "blue", alpha = 0.7) +
     geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
-    facet_wrap(~SampleSize, ncol = 1) +
-    labs(title = paste("Model", model_id, " - Pointwise Coverage (PICP)"),
-         y = "Coverage Probability",
-         x = "x") +
     ylim(0, 1) +
+    labs(
+      title = sprintf("Model %d, Sample Size %d - Pointwise Coverage", model, m),
+      x = "x", y = "Coverage"
+    ) +
     theme_minimal(base_size = 14)
   
-  ggsave(sprintf("paper_picp_plots/Model_%d_PICP_plot.png", model_id),
-         plot = p, width = 8, height = 12)
+  ggsave(sprintf("paper_pointwise_plots/Model_%d_m_%d_pointwise.png", model, m),
+         plot = p, width = 8, height = 5)
 }
