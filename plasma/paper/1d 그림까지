@@ -143,103 +143,185 @@ find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
 #-----------------------------------------------------------# 필요한 함수 ##
 
 data <- read.csv("~/Downloads/plasma.csv")
-var_name <- "BETAPLASMA"#하는 변수명 하나 입력
-x <- data$AGE
-y <- data[[var_name]]
+var_name <- "BETAPLASMA"
+colnames(data)
 
-clean_data <- function(x, y) {
-  idx <- which(!is.na(x) & !is.na(y) & !is.infinite(x) & !is.infinite(y))
-  return(list(x = x[idx], y = y[idx]))
+target_vars <- c("QUETELET", "CALORIES", "FAT", "FIBER", "ALCOHOL","CHOLESTEROL", "BETADIET", "RETDIET", "BETAPLASMA", "RETPLASMA")
+for (var_name in target_vars){
+  x <- data$AGE
+  y <- data[[var_name]]
+  
+  clean_data <- function(x, y) {
+    idx <- which(!is.na(x) & !is.na(y) & !is.infinite(x) & !is.infinite(y))
+    return(list(x = x[idx], y = y[idx]))
+  }
+  
+  set.seed(1)
+  m <- length(y)
+  n_test <- 115
+  n_train <- m - n_test
+  idx <- sample(seq_len(m))
+  train_idx <- idx[1:n_train]
+  test_idx <- idx[(n_train+1):m]
+  
+  train_x <- x[train_idx]
+  raw_train_y <- y[train_idx]
+  train_clean <- clean_data(train_x, raw_train_y)
+  train_x <- train_clean$x
+  raw_train_y <- train_clean$y
+  
+  # 2. 분산 정규화 및 변환
+  raw_fit <- smooth.spline(train_x, raw_train_y, cv = FALSE)
+  raw_pred_y <- predict(raw_fit, train_x)$y
+  raw_residuals <- raw_train_y - raw_pred_y
+  fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log"))
+  var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
+  var_list <- pmax(var_list, 1e-4)
+  transform_y <- raw_train_y / sqrt(var_list)
+  
+  # 3. 변환된 데이터로 spline 적합
+  transform_clean <- clean_data(train_x, transform_y)
+  train_x <- transform_clean$x
+  train_y <- transform_clean$y
+  
+  k_lookup_path <- paste0("k_lookup_", var_name, ".rds")
+  
+  # 🔍 파일 없으면 생성
+  if (!file.exists(k_lookup_path)) {
+    cat("🔧 k_lookup 파일이 없어 새로 생성 중:", k_lookup_path, "\n")
+    
+    # (생성 로직 생략, 이미 잘 짜두셨음)
+    
+    saveRDS(k_lookup, k_lookup_path)
+  } else {
+    cat("✅ k_lookup 파일 불러옴:", k_lookup_path, "\n")
+  }
+  
+  k_lookup_mem <- readRDS(k_lookup_path)
+  
+  
+  # 🔍 파일 없으면 생성
+  if (!file.exists(k_lookup_path)) {
+    cat("🔧 k_lookup 파일이 없어 새로 생성 중:", k_lookup_path, "\n")
+    
+    # train_x, raw_train_y는 생성된 상태라고 가정
+    raw_fit <- smooth.spline(train_x, raw_train_y, cv = FALSE)
+    raw_pred_y <- predict(raw_fit, train_x)$y
+    raw_residuals <- raw_train_y - raw_pred_y
+    
+    fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log"))
+    var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
+    var_list <- pmax(var_list, 1e-4)
+    
+    transform_y <- raw_train_y / sqrt(var_list)
+    transform_clean <- clean_data(train_x, transform_y)
+    train_x <- transform_clean$x
+    train_y <- transform_clean$y
+    
+    fit <- smooth.spline(train_x, train_y, cv = FALSE)
+    residuals <- predict(fit, train_x)$y - train_y
+    
+    B <- bs(train_x, df = max(fit$df), 3)
+    D <- diff(diag(ncol(B)), differences = 2)
+    S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+    smoother_matrix <- B %*% S_inv %*% t(B)
+    I_n <- diag(length(train_x))
+    residual_matrix <- I_n - smoother_matrix
+    
+    numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+    denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+    nu <- numerator / denominator
+    
+    norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
+    unique_nlh <- sort(unique(round(norm_lx_h_values, 5)))
+    
+    k_lookup <- mclapply(seq_along(unique_nlh), function(i) {
+      nlh <- unique_nlh[i]
+      find_k_factor(nu = nu, norm_lx_h = nlh, index = i)
+    }, mc.cores = detectCores() - 1)
+    names(k_lookup) <- unique_nlh
+    
+    saveRDS(k_lookup, k_lookup_path)
+    
+  } else {
+    cat("✅ k_lookup 파일 불러옴:", k_lookup_path, "\n")
+  }
+  
+  
+  
+  fit <- smooth.spline(train_x, train_y, cv = FALSE)
+  residuals <- predict(fit, train_x)$y - train_y
+  B <- bs(train_x, df = max(fit$df), 3)
+  D <- diff(diag(ncol(B)), differences = 2)
+  S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+  smoother_matrix <- B %*% S_inv %*% t(B)
+  I_n <- diag(length(train_x))
+  residual_matrix <- I_n - smoother_matrix
+  
+  # 자유도 nu 계산
+  numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+  denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+  nu <- numerator / denominator
+  
+  # norm_lx_h 계산 및 k-factor lookup 불러오기
+  norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
+  rounded_nlh <- round(norm_lx_h_values, 5)
+  k_lookup_mem <- readRDS(paste0("k_lookup_", var_name, ".rds"))
+  
+  
+  # 누락된 k-factor 있으면 계산
+  missing_nlh <- setdiff(as.character(rounded_nlh), names(k_lookup_mem))
+  if (length(missing_nlh) > 0) {
+    cat("⚠️ 누락된 k-factor 계산:", length(missing_nlh), "개\n")
+    new_k <- mclapply(seq_along(missing_nlh), function(i) {
+      nlh <- as.numeric(missing_nlh[i])
+      find_k_factor(nu = nu, norm_lx_h = nlh, index = i)
+    }, mc.cores = 1)
+    names(new_k) <- missing_nlh
+    k_lookup_mem <- c(k_lookup_mem, new_k)
+    saveRDS(k_lookup_mem, paste0("k_lookup_", var_name, ".rds"))
+  }
+  
+  k_factors <- as.numeric(unlist(k_lookup_mem[as.character(rounded_nlh)]))
+  
+  # 4. 구간 계산
+  pred_y <- predict(fit, train_x)$y
+  estimated_variance <- (t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix))
+  TI_upper <- pred_y + k_factors * as.numeric(estimated_variance)
+  TI_lower <- pred_y - k_factors * as.numeric(estimated_variance)
+  TI_upper <- TI_upper * sqrt(var_list)
+  TI_lower <- TI_lower * sqrt(var_list)
+  
+  # 5. 시각화
+  plot_df <- data.frame(
+    x = train_x,
+    pred = pred_y * sqrt(var_list),  # 원래 스케일로 되돌림
+    lower = TI_lower,
+    upper = TI_upper,
+    y = raw_train_y
+  )
+  plot_df <- plot_df[order(plot_df$x), ]
+  
+  p <- ggplot(plot_df, aes(x = x)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "skyblue", alpha = 0.4) +
+    geom_line(aes(y = pred), color = "blue", size = 1) +
+    geom_point(aes(y = y), color = "black", size = 1, alpha = 0.5) +
+    labs(
+      title = paste("Tolerance Interval for", var_name),
+      x = "AGE",
+      y = var_name
+    ) +
+    theme_bw()
+  
+  # 저장할 디렉토리 생성
+  output_dir <- "0521_Tolerance_Plots"
+  if (!dir.exists(output_dir)) dir.create(output_dir)
+  
+  # 파일 저장
+  ggsave(
+    filename = file.path(output_dir, paste0("TI_plot_", var_name, ".png")),
+    plot = p,
+    width = 8,
+    height = 5
+  )
 }
-
-set.seed(1)
-m <- length(y)
-n_test <- 115
-n_train <- m - n_test
-idx <- sample(seq_len(m))
-train_idx <- idx[1:n_train]
-test_idx <- idx[(n_train+1):m]
-
-train_x <- x[train_idx]
-raw_train_y <- y[train_idx]
-train_clean <- clean_data(train_x, raw_train_y)
-train_x <- train_clean$x
-raw_train_y <- train_clean$y
-
-# 2. 분산 정규화 및 변환
-raw_fit <- smooth.spline(train_x, raw_train_y, cv = FALSE)
-raw_pred_y <- predict(raw_fit, train_x)$y
-raw_residuals <- raw_train_y - raw_pred_y
-fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log"))
-var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
-var_list <- pmax(var_list, 1e-4)
-transform_y <- raw_train_y / sqrt(var_list)
-
-# 3. 변환된 데이터로 spline 적합
-transform_clean <- clean_data(train_x, transform_y)
-train_x <- transform_clean$x
-train_y <- transform_clean$y
-
-fit <- smooth.spline(train_x, train_y, cv = FALSE)
-residuals <- predict(fit, train_x)$y - train_y
-B <- bs(train_x, df = max(fit$df), 3)
-D <- diff(diag(ncol(B)), differences = 2)
-S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
-smoother_matrix <- B %*% S_inv %*% t(B)
-I_n <- diag(length(train_x))
-residual_matrix <- I_n - smoother_matrix
-
-# 자유도 nu 계산
-numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
-denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
-nu <- numerator / denominator
-
-# norm_lx_h 계산 및 k-factor lookup 불러오기
-norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
-rounded_nlh <- round(norm_lx_h_values, 5)
-k_lookup_mem <- readRDS(paste0( var_name, "_k_lookup_saved.rds"))
-
-
-# 누락된 k-factor 있으면 계산
-missing_nlh <- setdiff(as.character(rounded_nlh), names(k_lookup_mem))
-if (length(missing_nlh) > 0) {
-  cat("⚠️ 누락된 k-factor 계산:", length(missing_nlh), "개\n")
-  new_k <- mclapply(seq_along(missing_nlh), function(i) {
-    nlh <- as.numeric(missing_nlh[i])
-    find_k_factor(nu = nu, norm_lx_h = nlh, index = i)
-  }, mc.cores = 1)
-  names(new_k) <- missing_nlh
-  k_lookup_mem <- c(k_lookup_mem, new_k)
-  saveRDS(k_lookup_mem, paste0(var_name, "_k_lookup_saved.rds"))
-}
-
-k_factors <- as.numeric(unlist(k_lookup_mem[as.character(rounded_nlh)]))
-
-# 4. 구간 계산
-pred_y <- predict(fit, train_x)$y
-estimated_variance <- (t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix))
-TI_upper <- pred_y + k_factors * as.numeric(estimated_variance)
-TI_lower <- pred_y - k_factors * as.numeric(estimated_variance)
-TI_upper <- TI_upper * sqrt(var_list)
-TI_lower <- TI_lower * sqrt(var_list)
-
-# 5. 시각화
-plot_df <- data.frame(
-  x = train_x,
-  pred = pred_y * sqrt(var_list),  # 원래 스케일로 되돌림
-  lower = TI_lower,
-  upper = TI_upper,
-  y = raw_train_y
-)
-plot_df <- plot_df[order(plot_df$x), ]
-
-ggplot(plot_df, aes(x = x)) +
-  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "skyblue", alpha = 0.4) +
-  geom_line(aes(y = pred), color = "blue", size = 1) +
-  geom_point(aes(y = y), color = "black", size = 1, alpha = 0.5) +
-  labs(
-    title = paste("Tolerance Interval for", var_name),
-    x = "AGE",
-    y = var_name
-  ) +
-  theme_minimal(base_size = 14)
