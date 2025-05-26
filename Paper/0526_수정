@@ -1,0 +1,407 @@
+#### 교수님 답장 받고 전부 다시짜기 ####
+library(splines)
+library(foreach)
+library(progressr)
+library(doFuture)
+library(future)
+library(splines)
+library(MASS)
+
+
+# 🔥 2. 필요한 함수 정의
+
+# 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  #x <- sort(runif(n, 0, 10)) # x도 랜덤하게 생성
+  x <- seq(0, 10, length.out=n)
+  base <- 3 * cos(x) - 5 * (x / 15)^2
+  
+  if (model == 1) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- base + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- base + rt(n, df = 3)
+  }
+  if (model == 5) {
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    y <- base + rnorm(n, mean = 0, sd = sd_x)
+  }
+  if (model == 6) {
+    y <- base + rnorm(n, mean = 0, sd = 1) + abs(rnorm(n, 0, 1)) - sqrt(2/pi)
+  }
+  if (model == 7) {
+    noise <- ifelse(runif(n) < 0.5, rnorm(n, mean = -3, sd = 1), rnorm(n, mean = 3, sd = 1))
+    y <- base + noise
+  }
+  
+  if (model == 8) {
+    noise <- ifelse(x < 5,
+                    rnorm(n, mean = 0, sd = 1 + 0.5 * x),
+                    rnorm(n, mean = 0, sd = 2 - 0.3 * (x - 5)))
+    y <- base + noise
+  }
+  
+  return(data.frame(x = x, y = y))
+}
+content_function <- function(model,lower,upper,x){
+  y = 3*cos(x) - 5*(x/15)^2
+  if (model == 1){
+    content <- pnorm(upper-y, mean=0, sd=2) - pnorm(lower-y, mean=0, sd=2)
+  }
+  if (model == 2){
+    content <- pnorm(upper-y, mean=0, sd=2*x) - pnorm(lower-y, mean=0, sd=2*x)
+  }
+  if (model == 3){
+    content <- pgamma(upper-y, shape=2, scale=2) - pgamma(lower-y, shape=2, scale=2)
+  }
+  if (model == 4){
+    content <- pt(upper-y, df=3) - pt(lower-y, df=3)
+  }
+  if (model == 5){
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    content <- pnorm(upper-y, mean=0, sd=sd_x)- pnorm(lower-y, mean=0, sd=sd_x)
+  }
+  if (model == 6){
+    #empirical content 계산 
+    N <- 1e+5
+    z1 <- rnorm(N, 0, 1)
+    z2 <- abs(rnorm(N, 0, 1)) - sqrt(2 / pi)
+    eps <- z1 + z2 #에러항 계산 후 
+    content <- mean((eps >= lower - y) & (eps <= upper - y)) #에러항이 들어오는 평균을 content 로 계산 
+  }
+  
+  if (model == 7) {
+    N <- 1e+5
+    u <- runif(N)
+    eps <- ifelse(u < 0.5, 
+                  rnorm(N, mean = -3, sd = 1), 
+                  rnorm(N, mean = 3, sd = 1))
+    content <- mean((eps >= lower - y) & (eps <= upper - y))
+  } 
+  
+  if (model == 8){
+    sd_x <- ifelse(x < 5, 1 + 0.5 * x, 2 - 0.3 * (x - 5))
+    content <- pnorm(upper - y, mean = 0, sd = sd_x) - pnorm(lower - y, mean = 0, sd = sd_x)
+  }
+  return(content)
+}
+
+
+# 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+# 근사로 k factor 계산하는 함수 
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
+
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    
+    # 벡터 입력 대응
+    out <- numeric(length(q_val))
+    
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      l <- lhs[i]
+      
+      # 계산 불가한 경우
+      if (is.nan(q) || is.nan(l) || is.na(q) || is.na(l)) {
+        out[i] <- 0
+        next
+      }
+      
+      if (l <= k^2) {
+        threshold <- (nu * q) / (k^2)
+        if (is.nan(threshold) || is.na(threshold)) {
+          out[i] <- 0
+          next
+        }
+        
+        prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+        if (is.nan(prob) || is.na(prob)) {
+          out[i] <- 1e-6
+        } else {
+          out[i] <- prob
+        }
+      } else {
+        out[i] <- 0
+      }
+    }
+    
+    return(out)
+  }, error = function(e) {
+    warning("compute_probability 계산 오류 발생")
+    return(rep(0, length(t)))  # t가 벡터면 그 길이에 맞게 0 반환
+  })
+}
+
+
+# 적분 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  
+  if (log(exp_term) < -20) {
+    #cat(sprintf("⚠️ 너무 작은 적분항: log(exp) = %.2f (t = %.4f, k = %.4f)\n",
+    return(1e-10)
+  }
+  
+  return(exp_term * prob_term)
+}
+
+# upper bound 계산 함수
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 20, by = 0.1)
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(length(lhs) == 1 && !is.na(lhs) && lhs <= k^2)
+  })
+  
+  if (any(valid_t)) {
+    return(max(t_seq[valid_t]))
+  } else {
+    warning("조건을 만족하는 t가 없음 — fallback to t = 15")
+    return(15)
+  }
+}
+
+# k-factor 계산 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
+  start_time <- Sys.time()
+  #cat("▶️ k-factor 계산 시작: index =", index, "\n")
+  
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
+      warning("upper_bound가 이상함 → fallback")
+      return(1e6)
+    }
+    
+    tryCatch({
+      integral_result <- integrate(
+        Vectorize(integrand),   # 함수 벡터화
+        lower = 0, upper = upper_bound,
+        k = k, nu = nu, P = P, norm_lx_h = norm_lx_h
+      )$value
+      
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      final_val <- pi_term * integral_result
+      error <- abs(final_val - gamma)
+      
+      #cat(sprintf("🧪 [OK] k=%.4f | norm=%.4f | integral=%.3e | final=%.5f | gamma=%.2f | error=%.4f\n",
+      # k, norm_lx_h, integral_result, final_val, gamma, error))
+      return(error)
+    }, error = function(e) {
+      cat(sprintf("❌ 적분에서 에러: k=%.4f, norm=%.4f\n", k, norm_lx_h))
+      cat("🔍 이유: ", e$message, "\n")
+      return(Inf)
+    })
+  }
+  
+  tryCatch({
+    out <- optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum
+    elapsed <- Sys.time() - start_time
+    #cat("✅ index =", index, ", 최적 k =", round(out, 5), ", 시간:", round(elapsed, 2), "초\n")
+    return(out)
+  }, error = function(e) {
+    warning("k 최적화 실패 → fallback 적용됨 (index =", index, ")")
+    return(NA)
+  })
+}
+
+# k factor 가져오기 (캐시 사용)
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
+
+transform_and_evaluate_sequential <- function(models, sample_sizes, M, seed){
+  set.seed(seed)
+  monte_carlo_results <- list()
+  pointwise_coverage_result <- list()
+  
+  for (model in models) {
+    for (m in sample_sizes) {
+      cat(sprintf("\n[START] Model: %d, Sample size: %d\n", model, m))
+      start_time_model <- Sys.time()
+      
+      lambda_list <- numeric(M)
+      results_list <- list()
+      content_matrix <- matrix(0, nrow = m, ncol = M)  # m rows (x_j), M columns (repetitions)
+      
+      
+      #mean_lambda 계산을 위해 M번 시뮬레이션 후 평균 저장 
+      for (i in 1:M) {
+        data_i <- generate_data(model, m)
+        x <- data_i$x
+        y <- data_i$y
+        
+        fit <- tryCatch({
+          smooth.spline(x = x, y = y, cv = TRUE)
+        }, error = function(e) {
+          warning(sprintf("⚠️ smoothing 실패: %s", e$message))
+          return(NULL)
+        })
+        
+        if (!is.null(fit) && !is.null(fit$lambda) && is.finite(fit$lambda)) {
+          lambda_list[i] <- fit$lambda
+        } else {
+          lambda_list[i] <- NA
+        }
+      }
+      
+      mean_lambda <- mean(lambda_list, na.rm = TRUE)
+      cat(sprintf("🌟 평균 lambda (Model %d, m=%d): %.5f\n", model, m, mean_lambda))
+      
+      # Monte Carlo Simulation 
+      for (i in 1:M) {
+        set.seed(i)
+        data_i <- generate_data(model, m)
+        x <- data_i$x
+        y <- data_i$y
+        
+        fit <- smooth.spline(x = x, y = y, cv = FALSE, lambda = mean_lambda)
+        pred_y<- predict(fit, x)$y
+        
+        if (model %in% c(2, 5, 8)) {
+          residuals <- y - pred_y
+          log_variance_fit <- smooth.spline(x, log(residuals^2 + 1e-6), cv = FALSE)
+          variance_hat <- exp(predict(log_variance_fit, x)$y)
+          
+          transform_y <- y / sqrt(variance_hat)
+          fit_trans <- smooth.spline(x, transform_y, cv = FALSE)
+          
+          B <- bs(x, df = fit_trans$df)
+          D <- diff(diag(ncol(B)), differences = 2)
+          S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+          S <- B %*% S_inv %*% t(B)
+          I_n <- diag(length(x))
+          R <- I_n - S
+          
+          residuals2 <- transform_y - predict(fit_trans, x)$y
+          est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+          est_var <- ifelse(is.na(est_var) | is.nan(est_var) , 1e-6, est_var)
+          
+          num <- sum(diag(t(R) %*% R))^2
+          den <- sum(diag((t(R) %*% R)^2))
+          nu <- num / den
+          
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+          k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+          
+          TI_upper <- pred_y + sqrt(est_var) * k_factors
+          TI_lower <- pred_y - sqrt(est_var) * k_factors
+          TI_upper <- TI_upper * sqrt(variance_hat)
+          TI_lower <- TI_lower * sqrt(variance_hat)
+        } else {
+          B <- bs(x, df = fit$df)
+          D <- diff(diag(ncol(B)), differences = 2)
+          S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+          S <- B %*% S_inv %*% t(B)
+          I_n <- diag(length(x))
+          R <- I_n - S
+          
+          residuals2 <- y - predict(fit, x)$y
+          est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+          est_var <- ifelse(is.na(est_var) | is.nan(est_var) | is.infinite(est_var), 1e-6, est_var)
+          
+          num <- sum(diag(t(R) %*% R))^2
+          den <- sum(diag((t(R) %*% R)^2))
+          nu <- num / den
+          
+          norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+          k_factors <- sapply(norm_lx_h_values, function(nlh) get_k_factor(nu, nlh))
+          
+          TI_upper <- pred_y + sqrt(est_var) * k_factors
+          TI_lower <- pred_y - sqrt(est_var) * k_factors
+        }
+        
+        content_xj <- numeric(m)
+        for (j in 1:m){
+          xj <- x[j]
+          content_matrix[j, i] <- content_function(model=model, lower=TI_lower[j], upper=TI_upper[j], x=xj)
+        }
+        
+      }
+      
+      coverage_proportion <- rowMeans(content_matrix >= 0.90)  # 각 x에서 content ≥ 0.90 된 비율
+      
+      pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
+        x = x,
+        coverage = coverage_proportion)
+      
+      end_time_model <- Sys.time()
+      duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+      cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
+    }
+  }
+}
+
+
+seed=123
+M=500
+models <- 1:8
+sample_sizes <- c(50, 100, 200, 500, 1000)
+
+# 결과 저장 
+k_lookup_global <- new.env()
+k_lookup_path <- "k_lookup_global.rds"
+
+monte_carlo_results <- list()
+pointwise_coveraage_result <- list()
+results <- transform_and_evaluate_sequential(models, sample_sizes, M, seed=seed)
+
+
+
+# 결과 정리 
+pointwise_coverage_result <- results$pointwise_coverage_result
+names(pointwise_coverage_result)
+
+library(dplyr)
+
+pointwise_df <- do.call(rbind, lapply(names(pointwise_coverage_result), function(name) {
+  df <- pointwise_coverage_result[[name]]
+  model <- as.integer(sub("Model_(\\d+)_.*", "\\1", name))
+  m <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
+  df$Model <- model
+  df$SampleSize <- m
+  return(df)
+}))
+
+# 선택적 정렬
+pointwise_df <- pointwise_df %>%
+  arrange(Model, SampleSize, x)
+
+write.csv(pointwise_df, "0526_pointwise_coverage_plot_data.csv", row.names = FALSE)
+
+ggplot(pointwise_df, aes(x = x, y = coverage)) +
+  geom_point(size = 1) +
+  facet_grid(Model ~ SampleSize, labeller = label_both) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+  ylim(0, 1) +
+  labs(
+    title = "Pointwise Coverage (Content ≥ 0.90)",
+    x = "x",
+    y = "Proportion of simulations with content ≥ 0.90"
+  ) +
+  theme_bw()
