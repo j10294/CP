@@ -1,0 +1,181 @@
+
+# hoeffding_simulation_Montecarlo
+library(gam)
+library(dplyr)
+#---------------------------------------------필요한 함수 정의 
+# 데이터 생성 함수 정의
+generate_data <- function(model, n) {
+  #x <- sort(runif(n, 0, 10)) # x도 랜덤하게 생성
+  x <- seq(0, 10, length.out=n)
+  base <- 3 * cos(x) - 5 * (x / 15)^2
+  
+  if (model == 1) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2))
+  }
+  if (model == 2) {
+    y <- base + rnorm(n, mean = 0, sd = sqrt(2 * x))
+  }
+  if (model == 3) {
+    y <- base + 4 - rgamma(n, shape = 2, scale = 2)
+  }
+  if (model == 4) {
+    y <- base + rt(n, df = 3)
+  }
+  if (model == 5) {
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    y <- base + rnorm(n, mean = 0, sd = sd_x)
+  }
+  if (model == 6) {
+    y <- base + rnorm(n, mean = 0, sd = 1) + abs(rnorm(n, 0, 1)) - sqrt(2/pi)
+  }
+  if (model == 7) {
+    noise <- ifelse(runif(n) < 0.5, rnorm(n, mean = -3, sd = 1), rnorm(n, mean = 3, sd = 1))
+    y <- base + noise
+  }
+  
+  if (model == 8) {
+    noise <- ifelse(x < 5,
+                    rnorm(n, mean = 0, sd = 1 + 0.5 * x),
+                    rnorm(n, mean = 0, sd = 2 - 0.3 * (x - 5)))
+    y <- base + noise
+  }
+  
+  return(data.frame(x = x, y = y))
+}
+content_function <- function(model,lower,upper,x){
+  y = 3*cos(x) - 5*(x/15)^2
+  if (model == 1){
+    content <- pnorm(upper-y, mean=0, sd=2) - pnorm(lower-y, mean=0, sd=2)
+  }
+  if (model == 2){
+    content <- pnorm(upper-y, mean=0, sd=2*x) - pnorm(lower-y, mean=0, sd=2*x)
+  }
+  if (model == 3){
+    content <- pgamma(upper-y, shape=2, scale=2) - pgamma(lower-y, shape=2, scale=2)
+  }
+  if (model == 4){
+    content <- pt(upper-y, df=3) - pt(lower-y, df=3)
+  }
+  if (model == 5){
+    sd_x <- 0.3 + 3 * exp(-(x - 5)^2 / (2 * 1.5^2))
+    content <- pnorm(upper-y, mean=0, sd=sd_x)- pnorm(lower-y, mean=0, sd=sd_x)
+  }
+  if (model == 6){
+    #empirical content 계산 
+    N <- 1e+5
+    z1 <- rnorm(N, 0, 1)
+    z2 <- abs(rnorm(N, 0, 1)) - sqrt(2 / pi)
+    eps <- z1 + z2 #에러항 계산 후 
+    content <- mean((eps >= lower - y) & (eps <= upper - y)) #에러항이 들어오는 평균을 content 로 계산 
+  }
+  
+  if (model == 7) {
+    N <- 1e+5
+    u <- runif(N)
+    eps <- ifelse(u < 0.5, 
+                  rnorm(N, mean = -3, sd = 1), 
+                  rnorm(N, mean = 3, sd = 1))
+    content <- mean((eps >= lower - y) & (eps <= upper - y))
+  } 
+  
+  if (model == 8){
+    sd_x <- ifelse(x < 5, 1 + 0.5 * x, 2 - 0.3 * (x - 5))
+    content <- pnorm(upper - y, mean = 0, sd = sd_x) - pnorm(lower - y, mean = 0, sd = sd_x)
+  }
+  return(content)
+}
+
+
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
+  f <- function(lambda, alpha, delta, y, pred, variance, n){
+    risk <- mean(y <= pred - sqrt(variance)*lambda |
+                   y >= pred + sqrt(variance)*lambda, na.rm=TRUE)
+    threshold <- (1 - alpha) - sqrt(log(1/delta) / (2*n))
+    return(risk - threshold)
+  }
+  lambda_hat <- tryCatch({
+    uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta,
+            y=y, pred=pred, variance=variance, n=n)$root
+  }, error=function(e){
+    optimize(function(lambda) f(lambda, alpha, delta, y, pred, variance, n),
+             interval = c(lower, upper))$minimum
+  })
+  return(lambda_hat)
+}
+#------------------------------------------------------------------------------------------------
+# 모델 번호와 샘플 크기 정의
+models<-1:8
+sample_sizes <- c(50, 100, 200, 500, 1000)
+
+alpha <- 0.95
+delta <- 0.90
+M<-500
+
+results <- data.frame()
+pointwise_cov_list <- list()
+
+
+for (model in models){
+  for (n in sample_sizes){
+    start_time <- Sys.time()
+    
+    content_matrix <- matrix(0, nrow = m, ncol = M) 
+    
+    for (i in 1:M){
+      set.seed(i) #로 시드 다르게 설정
+      
+      data <- generate_data(model, m)
+      x <- data$x
+      y <- data$y
+      
+      n_train <- m/2
+      n_cal <- m/2
+      
+      # 데이터 샘플링
+      all_indices <- sample(m)
+      train_index <- all_indices[1:n_train]
+      cal_index <- all_indices[(n_train + 1):m]
+      
+      train_x <- x[train_index]
+      train_y <- y[train_index]
+      cal_x <- x[cal_index]
+      cal_y <- y[cal_index]
+      
+
+      # 1. 훈련 데이터를 이용해 모델 학습 (평균 예측값 계산)
+      fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, tol=1e-2)
+      pred_y <- predict(fit, cal_x)$y  # mean prediction
+      
+      # 2. Calibration 데이터로 예측 오차의 분산 추정 (log scale로)
+      train_res <- train_y - predict(fit, train_x)$y
+      log_res2 <- log(train_res^2+1e-6)
+      gam_model <- gam(log_res2 ~ s(train_x))
+      log_pred <- predict(gam_model, newdata = data.frame(train_x = cal_x))
+      variance_hat <- exp(log_pred) # 분산 추정값
+      
+      # 3. Tolerance Interval 계산 (분산을 포함한 계산)
+      # 예시로 lambda_hat는 보통 특정 확률값을 기준으로 계산
+      lambda_hat <- find_lambda_hat(alpha,delta , cal_y, pred_y, variance_hat, length(cal_y))
+      
+      TI_upper <- pred_y + sqrt(variance_hat) * lambda_hat
+      TI_lower <- pred_y - sqrt(variance_hat) * lambda_hat
+      
+      content_xj <- numeric(m)
+      for (j in 1:m){
+        xj <- x[j]
+        content_matrix[j, i] <- content_function(model=model, lower=TI_lower[j], upper=TI_upper[j], x=xj)
+      }
+    }
+    
+      
+    coverage_proportion <- rowMeans(content_matrix >= 0.90)  # 각 x에서 content ≥ 0.90 된 비율
+    
+    pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
+      x = x,
+      coverage = coverage_proportion)
+    
+    end_time_model <- Sys.time()
+    duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
+    cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
+    }
+}
