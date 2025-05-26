@@ -42,16 +42,18 @@ generate_data <- function(model, n) {
   
   return(data.frame(x = x, y = y))
 }
+
 content_function <- function(model,lower,upper,x){
   y = 3*cos(x) - 5*(x/15)^2
   if (model == 1){
-    content <- pnorm(upper-y, mean=0, sd=2) - pnorm(lower-y, mean=0, sd=2)
+    content <- pnorm(upper-y, mean=0, sd=sqrt(2)) - pnorm(lower-y, mean=0, sd=sqrt(2)) #분산 2로 수정. guo and young model 1과 동일 
   }
   if (model == 2){
-    content <- pnorm(upper-y, mean=0, sd=2*x) - pnorm(lower-y, mean=0, sd=2*x)
+    content <- pnorm(upper-y, mean=0, sd=sqrt(2 * x)) - pnorm(lower-y, mean=0, sd=sqrt(2 * x))
   }
   if (model == 3){
-    content <- pgamma(upper-y, shape=2, scale=2) - pgamma(lower-y, shape=2, scale=2)
+    content <- pgamma(4 - (lower - y), shape = 2, scale = 2) -
+      pgamma(4 - (upper - y), shape = 2, scale = 2)
   }
   if (model == 4){
     content <- pt(upper-y, df=3) - pt(lower-y, df=3)
@@ -86,11 +88,12 @@ content_function <- function(model,lower,upper,x){
 }
 
 
+
 find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
   f <- function(lambda, alpha, delta, y, pred, variance, n){
     risk <- mean(y <= pred - sqrt(variance)*lambda |
                    y >= pred + sqrt(variance)*lambda, na.rm=TRUE)
-    threshold <- (1 - alpha) - sqrt(log(1/delta) / (2*n))
+    threshold <- (1 - alpha) - sqrt(log(1/(1-delta)) / (2*n))
     return(risk - threshold)
   }
   lambda_hat <- tryCatch({
@@ -104,22 +107,21 @@ find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5
 }
 #------------------------------------------------------------------------------------------------
 # 모델 번호와 샘플 크기 정의
-models<-1:8
-sample_sizes <- c(50, 100, 200, 500, 1000)
+models<-5:8
+sample_sizes <- c(50, 100, 200)#, 500, 1000)
 
 alpha <- 0.95
 delta <- 0.90
 M<-500
 
-results <- data.frame()
-pointwise_cov_list <- list()
+pointwise_coverage_result <- list()
 
 
 for (model in models){
-  for (n in sample_sizes){
+  for (m in sample_sizes){
     start_time <- Sys.time()
     
-    content_matrix <- matrix(0, nrow = m, ncol = M) 
+    content_matrix <- matrix(NA, nrow = m, ncol = M) 
     
     for (i in 1:M){
       set.seed(i) #로 시드 다르게 설정
@@ -141,7 +143,7 @@ for (model in models){
       cal_x <- x[cal_index]
       cal_y <- y[cal_index]
       
-
+      
       # 1. 훈련 데이터를 이용해 모델 학습 (평균 예측값 계산)
       fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE, tol=1e-2)
       pred_y <- predict(fit, cal_x)$y  # mean prediction
@@ -160,22 +162,47 @@ for (model in models){
       TI_upper <- pred_y + sqrt(variance_hat) * lambda_hat
       TI_lower <- pred_y - sqrt(variance_hat) * lambda_hat
       
-      content_xj <- numeric(m)
-      for (j in 1:m){
-        xj <- x[j]
-        content_matrix[j, i] <- content_function(model=model, lower=TI_lower[j], upper=TI_upper[j], x=xj)
+      for (k in 1:n_cal){
+        xj <- cal_x[k]
+        j <- which(x==xj)
+        content_matrix[j, i] <- content_function(model=model, lower=TI_lower[k], upper=TI_upper[k], x=xj)
       }
     }
-    
-      
-    coverage_proportion <- rowMeans(content_matrix >= 0.90)  # 각 x에서 content ≥ 0.90 된 비율
+
+    coverage_proportion <- rowMeans(content_matrix >= 0.90, na.rm=TRUE)  # 각 x에서 content ≥ 0.90 된 비율. cal_x에 들어가는 값들만 계산하기위해 na.rm=TRUE로 설정 
     
     pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
       x = x,
       coverage = coverage_proportion)
     
-    end_time_model <- Sys.time()
-    duration <- round(difftime(end_time_model, start_time_model, units = "mins"), 2)
-    cat(sprintf("[END] Model: %d, Sample size: %d, — %.2f minutes\n", model, m, duration))
-    }
+    duration <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    cat("[END] Model:", model, "Sample size:", m, "—", round(duration, 2), "seconds\n")
+  }
 }
+
+
+# 결과 정리 
+pointwise_df <- do.call(rbind, lapply(names(pointwise_coverage_result), function(name) {
+  if (!grepl("^Model_\\d+_m_\\d+$", name)) return(NULL)  # 이름 형식 확인
+  
+  df <- pointwise_coverage_result[[name]]
+  model <- as.integer(sub("Model_(\\d+)_.*", "\\1", name))
+  m <- as.integer(sub(".*_m_(\\d+)", "\\1", name))
+  df$Model <- model
+  df$SampleSize <- m
+  return(df)
+}))
+
+
+pointwise_df
+ggplot(pointwise_df, aes(x = x, y = coverage)) +
+  geom_point(size = 1) +
+  facet_grid(Model ~ SampleSize, labeller = label_both) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+  ylim(0, 1) +
+  labs(
+    title = "Pointwise Coverage (Content ≥ 0.90)",
+    x = "x",
+    y = "Proportion of simulations with content ≥ 0.90"
+  ) +
+  theme_bw()
