@@ -1,0 +1,35 @@
+# Early Stopping using window
+find_lambda_hat<- function(alpha, delta, y, pred, variance, n,
+                                   lower = 0, upper = 30, step = 1e-3,
+                                   epsilon = 0, tol = 1e-6, window = 500) {
+  threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
+  lambda_seq <- seq(lower, upper, by = step)
+  f_vals <- rep(NA, window)
+  
+  for (i in seq_along(lambda_seq)) {
+    lambda <- lambda_seq[i]
+    risk <- mean(
+      y <= pred - sqrt(variance) * lambda |
+        y >= pred + sqrt(variance) * lambda,
+      na.rm = TRUE
+    )
+    f_val <- abs(risk - threshold)
+    
+    if (f_val <= epsilon) return(lambda)
+    
+    f_vals <- c(f_vals[-1], f_val)
+    
+    if (sum(!is.na(f_vals)) == window) {
+      deltas <- diff(f_vals)
+      if (all(abs(deltas) < tol)) return(lambda)
+    }
+  }
+  
+  return(NA)
+}
+
+
+window <- 1000
+
+
+#
