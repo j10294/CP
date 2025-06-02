@@ -1,7 +1,95 @@
-# Early Stopping using window
+#1. Shifted Logit
+# Shifted logit 정의
+shifted_logit <- function(x, epsilon) {
+  log(x + epsilon) + log(1 + epsilon) - log(1 - x + epsilon) - log(epsilon)
+}
+
+find_lambda_hat_infimum <- function(alpha, delta, y, pred, variance, n,
+                                    lower = 0, upper = 30, step = 1e-3,
+                                    epsilon = 1e-3, tol = 1e-6, verbose = TRUE) {
+  # 1. threshold 계산
+  tau <- shifted_logit(1 - alpha, epsilon)
+  a_n <- sqrt((1 / (2 * n)) * log(1 / delta)) * 2 * log((1 + epsilon) / epsilon)
+  threshold <- tau - a_n
+  
+  # 2. 출력
+  if (verbose) {
+    cat("🔍 [DEBUG INFO]\n")
+    cat(sprintf("tau        = %.6f\n", tau))
+    cat(sprintf("a_n        = %.6f\n", a_n))
+    cat(sprintf("threshold  = %.6f\n", threshold))
+    cat("------------\n")
+  }
+  
+  # 3. lambda 탐색
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    # indicator function
+    L_i <- as.numeric(y <= pred - sqrt(variance) * lambda |
+                        y >= pred + sqrt(variance) * lambda)
+    # shifted logit risk
+    Z_i <- shifted_logit(L_i, epsilon)
+    risk <- mean(Z_i, na.rm = TRUE)
+    
+    if (verbose && lambda %% 1 == 0) {
+      cat(sprintf("lambda = %.4f | risk = %.6f\n", lambda, risk))
+    }
+    
+    # 4. 처음으로 조건 만족하는 lambda 발견
+    if (risk <= threshold) {
+      if (verbose) cat(sprintf("✅ Found infimum lambda = %.4f (risk = %.6f)\n", lambda, risk))
+      return(lambda)
+    }
+  }
+  
+  # 5. 못 찾은 경우
+  if (verbose) cat("❌ No lambda found satisfying risk ≤ threshold\n")
+  return(NA)
+}
+
+
+# 2. Shifted Log
+shifted_log <- function(x, epsilon) {
+  log((1 + epsilon) / (x + epsilon))
+}
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n,
+                            lower = 0, upper = 30, step = 1e-3,
+                            verbose = TRUE, plot_result = TRUE) {
+  threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
+  threshold <- max(threshold, 0)  # 💡 음수면 0으로 보정
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  risks <- sapply(lambda_seq, function(lambda) {
+    mean(y < pred - sqrt(variance) * lambda | y > pred + sqrt(variance) * lambda, na.rm = TRUE)
+  })
+  
+  if (plot_result) {
+    plot(lambda_seq, risks, type = "l", col = "blue",
+         main = "Risk vs Lambda", xlab = "lambda", ylab = "Risk")
+    abline(h = threshold, col = "red", lty = 2)
+  }
+  
+  if (any(risks <= threshold)) {
+    best_lambda <- min(lambda_seq[risks <= threshold]) #find infimum of lambda 
+    if (verbose) cat(sprintf("✅ lambda = %.4f (risk = %.6f)\n", best_lambda,
+                             risks[which(lambda_seq == best_lambda)]))
+    return(best_lambda)
+  } else {
+    if (verbose) cat("❌ No valid lambda found\n")
+    return(NA)
+  }
+}
+
+
+
+#3-1 Epsilon-Margin
+
+
+#3-2. Early Stopping using window
 find_lambda_hat<- function(alpha, delta, y, pred, variance, n,
                                    lower = 0, upper = 30, step = 1e-3,
-                                   epsilon = 0, tol = 1e-6, window = 500) {
+                                   epsilon = 0, tol = 1e-6, window = 1000) {
   threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
   lambda_seq <- seq(lower, upper, by = step)
   f_vals <- rep(NA, window)
@@ -28,8 +116,6 @@ find_lambda_hat<- function(alpha, delta, y, pred, variance, n,
   return(NA)
 }
 
-
-window <- 1000
 
 
 #
