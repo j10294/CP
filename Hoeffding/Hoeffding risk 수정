@@ -1,4 +1,6 @@
+##############################
 #1. Shifted Logit
+##############################
 # Shifted logit 정의
 shifted_logit <- function(x, epsilon) {
   log(x + epsilon) + log(1 + epsilon) - log(1 - x + epsilon) - log(epsilon)
@@ -48,8 +50,9 @@ find_lambda_hat_infimum <- function(alpha, delta, y, pred, variance, n,
   return(NA)
 }
 
-
+##############################
 # 2. Shifted Log
+##############################
 shifted_log <- function(x, epsilon) {
   log((1 + epsilon) / (x + epsilon))
 }
@@ -82,11 +85,19 @@ find_lambda_hat <- function(alpha, delta, y, pred, variance, n,
 }
 
 
-
+##############################
 #3-1 Epsilon-Margin
+##############################
 
 
+
+
+
+
+
+##############################
 #3-2. Early Stopping using window
+##############################
 find_lambda_hat<- function(alpha, delta, y, pred, variance, n,
                                    lower = 0, upper = 30, step = 1e-3,
                                    epsilon = 0, tol = 1e-6, window = 1000) {
