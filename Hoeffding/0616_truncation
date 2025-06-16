@@ -32,7 +32,6 @@ generate_data <- function(model, n) {
     noise <- ifelse(runif(n) < 0.5, rnorm(n, mean = -3, sd = 1), rnorm(n, mean = 3, sd = 1))
     y <- base + noise
   }
-  
   if (model == 8) {
     noise <- ifelse(x < 5,
                     rnorm(n, mean = 0, sd = 1 + 0.5 * x),
@@ -88,30 +87,40 @@ content_function <- function(model,lower,upper,x){
 }
 
 
-
-find_lambda_hat <- function(alpha, delta, y, pred, variance, n, lower=0, upper=5){
-  f <- function(lambda, alpha, delta, y, pred, variance, n){
-    risk <- mean(y <= pred - sqrt(variance)*lambda |
-                   y >= pred + sqrt(variance)*lambda, na.rm=TRUE)
-    threshold <- (1 - alpha) - sqrt(log(1/(1-delta)) / (2*n))
-    return(risk - threshold)
+# truncation 이용해 수정한 find_lambda_hat 함수 
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n,
+                            lower = 0, upper = 30, step = 1e-3) {
+  
+  threshold <- alpha - sqrt(log(1/delta) / (2*n))
+  threshold <- max(0, threshold) #truncation
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    # empirical risk 계산
+    risk <- mean(
+      y <= pred - sqrt(variance) * lambda |
+        y >= pred + sqrt(variance) * lambda,
+      na.rm = TRUE
+    )
+    
+    # 조건을 만족하는 가장 첫 λ 반환
+    if (risk <= threshold) {
+      return(lambda)
+    }
   }
-  lambda_hat <- tryCatch({
-    uniroot(f, interval=c(lower, upper), alpha=alpha, delta=delta,
-            y=y, pred=pred, variance=variance, n=n)$root
-  }, error=function(e){
-    optimize(function(lambda) f(lambda, alpha, delta, y, pred, variance, n),
-             interval = c(lower, upper))$minimum
-  })
-  return(lambda_hat)
+  
+  # 조건 만족하는 lambda가 없을 경우
+  return(NA)
 }
+
 #------------------------------------------------------------------------------------------------
 # 모델 번호와 샘플 크기 정의
-models<-5:8
+models<-1:8
 sample_sizes <- c(50, 100, 200)#, 500, 1000)
 
-alpha <- 0.95
-delta <- 0.90
+alpha <- 0.10 #risk의 상한 
+delta <- 0.05 #1-confidence level
 M<-500
 
 pointwise_coverage_result <- list()
@@ -168,12 +177,14 @@ for (model in models){
         content_matrix[j, i] <- content_function(model=model, lower=TI_lower[k], upper=TI_upper[k], x=xj)
       }
     }
-
+    
+    na_proportion <- rowMeans(is.na(content_matrix))
     coverage_proportion <- rowMeans(content_matrix >= 0.90, na.rm=TRUE)  # 각 x에서 content ≥ 0.90 된 비율. cal_x에 들어가는 값들만 계산하기위해 na.rm=TRUE로 설정 
     
     pointwise_coverage_result[[paste0("Model_", model, "_m_", m)]] <- data.frame(
       x = x,
-      coverage = coverage_proportion)
+      coverage = coverage_proportion,
+      na_proportion = na_proportion)
     
     duration <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     cat("[END] Model:", model, "Sample size:", m, "—", round(duration, 2), "seconds\n")
