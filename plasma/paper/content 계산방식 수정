@@ -1,0 +1,352 @@
+# real data paper 1d
+
+#0428_paper_real_2var.R
+
+#-----------------------------------------------------------# 필요한 함수 ##
+# 벡터의 L2 norm 계산 함수
+compute_norm <- function(vector) {
+  return(sqrt(sum(vector^2)))
+}
+
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    
+    # 벡터 입력 대응
+    out <- numeric(length(q_val))
+    
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      l <- lhs[i]
+      
+      # 계산 불가한 경우
+      if (is.nan(q) || is.nan(l) || is.na(q) || is.na(l)) {
+        out[i] <- 0
+        next
+      }
+      
+      if (l <= k^2) {
+        threshold <- (nu * q) / (k^2)
+        if (is.nan(threshold) || is.na(threshold)) {
+          out[i] <- 0
+          next
+        }
+        
+        prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+        if (is.nan(prob) || is.na(prob)) {
+          out[i] <- 1e-6
+        } else {
+          out[i] <- prob
+        }
+      } else {
+        out[i] <- 0
+      }
+    }
+    
+    return(out)
+  }, error = function(e) {
+    warning("compute_probability 계산 오류 발생")
+    return(rep(0, length(t)))  # t가 벡터면 그 길이에 맞게 0 반환
+  })
+}
+
+
+# 적분 함수
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  
+  if (log(exp_term) < -20) {
+    #cat(sprintf("⚠️ 너무 작은 적분항: log(exp) = %.2f (t = %.4f, k = %.4f)\n",
+    return(1e-10)
+  }
+  
+  return(exp_term * prob_term)
+}
+
+# upper bound 계산 함수
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 20, by = 0.1)
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(length(lhs) == 1 && !is.na(lhs) && lhs <= k^2)
+  })
+  
+  if (any(valid_t)) {
+    return(max(t_seq[valid_t]))
+  } else {
+    warning("조건을 만족하는 t가 없음 — fallback to t = 15")
+    return(15)
+  }
+}
+
+
+
+# 근사로 k factor 계산하는 함수 
+find_k_factor_fast <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  sqrt(nu * qchisq(p = P, df = 1, ncp = norm_lx_h^2) / qchisq(p = 1 - gamma, df = nu))
+}
+
+
+# k-factor 계산 함수
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95, index = NA) {
+  start_time <- Sys.time()
+  #cat("▶️ k-factor 계산 시작: index =", index, "\n")
+  
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    
+    if (is.na(upper_bound) || is.infinite(upper_bound) || upper_bound < 1e-6) {
+      warning("upper_bound가 이상함 → fallback")
+      return(1e6)
+    }
+    
+    tryCatch({
+      integral_result <- integrate(
+        Vectorize(integrand),   # 함수 벡터화
+        lower = 0, upper = upper_bound,
+        k = k, nu = nu, P = P, norm_lx_h = norm_lx_h
+      )$value
+      
+      pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+      final_val <- pi_term * integral_result
+      error <- abs(final_val - gamma)
+      
+      #cat(sprintf("🧪 [OK] k=%.4f | norm=%.4f | integral=%.3e | final=%.5f | gamma=%.2f | error=%.4f\n",
+      # k, norm_lx_h, integral_result, final_val, gamma, error))
+      return(error)
+    }, error = function(e) {
+      cat(sprintf("❌ 적분에서 에러: k=%.4f, norm=%.4f\n", k, norm_lx_h))
+      cat("🔍 이유: ", e$message, "\n")
+      return(Inf)
+    })
+  }
+  
+  tryCatch({
+    out <- optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum
+    elapsed <- Sys.time() - start_time
+    #cat("✅ index =", index, ", 최적 k =", round(out, 5), ", 시간:", round(elapsed, 2), "초\n")
+    return(out)
+  }, error = function(e) {
+    warning("k 최적화 실패 → fallback 적용됨 (index =", index, ")")
+    return(NA)
+  })
+}
+
+# k factor 가져오기 (캐시 사용)
+get_k_factor <- function(nu, norm_lx_h) {
+  key <- as.character(round(norm_lx_h, 2))  # 소수점 2자리까지
+  if (exists(key, envir = k_lookup_global)) {
+    return(get(key, envir = k_lookup_global))
+  } else {
+    k_value <- find_k_factor(nu, norm_lx_h)
+    assign(key, k_value, envir = k_lookup_global)
+    return(k_value)
+  }
+}
+
+#-----------------------------------------------------------# 필요한 함수 ##
+
+
+
+
+library(splines)
+library(gam)
+library(MASS)
+library(parallel)
+library(progressr)
+library(doRNG)
+library(doFuture)
+library(future)
+library(future.apply)
+
+handlers(global = TRUE)
+plan(multisession, workers = availableCores() - 1)  # 코어 수 자동 설정
+
+registerDoFuture()
+
+# 사용할 변수 목록
+target_vars <- c("BETADIET", "BETAPLASMA", "CALORIES", "CHOLESTEROL", "FAT", "FIBER", "QUETELET", "RETDIET", "RETPLASMA")
+
+seeds <- 1:50
+results <- list()
+data <- read.csv("~/Desktop/plasma.csv")
+
+
+
+
+
+# 전처리: 변수 목록, 시드, 데이터 불러오기
+target_vars <- c("BETADIET", "BETAPLASMA", "CALORIES", "CHOLESTEROL", "FAT", "FIBER", "QUETELET", "RETDIET", "RETPLASMA")
+seeds <- 1:50
+results <- list()
+data <- read.csv("~/Desktop/plasma.csv")
+
+# 전처리 함수
+clean_data <- function(x, y) {
+  idx <- which(!is.na(x) & !is.na(y) & !is.infinite(x) & !is.infinite(y))
+  return(list(x = x[idx], y = y[idx]))
+}
+
+for (var_name in target_vars) {
+  cat("\n📦 시작: 변수 =", var_name, "\n")
+  
+  x <- data$AGE
+  y <- data[[var_name]]
+  
+  # 시드 1에서 k_lookup 저장
+  set.seed(1)
+  m <- length(y)
+  idx <- sample(seq_len(m))
+  train_idx <- idx[1:(m - 115)]
+  train_x <- x[train_idx]
+  raw_train_y <- y[train_idx]
+  
+  train_clean <- clean_data(train_x, raw_train_y)
+  train_x <- train_clean$x
+  raw_train_y <- train_clean$y
+  
+  raw_fit <- smooth.spline(train_x, raw_train_y, cv = FALSE)
+  raw_pred_y <- predict(raw_fit, train_x)$y
+  raw_residuals <- raw_train_y - raw_pred_y
+  fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log"))
+  var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
+  var_list <- pmax(var_list, 1e-4)
+  transform_y <- raw_train_y / sqrt(var_list)
+  
+  transform_clean <- clean_data(train_x, transform_y)
+  train_x <- transform_clean$x
+  train_y <- transform_clean$y
+  
+  fit <- smooth.spline(train_x, train_y, cv = FALSE)
+  residuals <- predict(fit, train_x)$y - train_y
+  B <- bs(train_x, df = max(fit$df), 3)
+  D <- diff(diag(ncol(B)), differences = 2)
+  S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+  smoother_matrix <- B %*% S_inv %*% t(B)
+  I_n <- diag(length(train_x))
+  residual_matrix <- I_n - smoother_matrix
+  
+  numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+  denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+  nu <- numerator / denominator
+  
+  norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
+  unique_nlh <- sort(unique(round(norm_lx_h_values, 5)))
+  
+  k_lookup <- mclapply(unique_nlh, function(nlh) {
+    find_k_factor_fast(nu = nu, norm_lx_h = nlh)
+  }, mc.cores = detectCores() - 1)
+  names(k_lookup) <- unique_nlh
+  saveRDS(k_lookup, paste0(var_name, "_k_lookup_saved.rds"))
+  
+  k_lookup_mem <- readRDS(paste0(var_name, "_k_lookup_saved.rds"))
+  
+  # 시드별 시뮬레이션
+  seed_results <- foreach(s = seeds, .combine = rbind,
+                          .packages = c("splines", "MASS", "mgcv", "stats"),
+                          .options.RNG = 123) %dorng% {
+                            set.seed(s)
+                            idx <- sample(seq_len(m))
+                            train_idx <- idx[1:(m - 115)]
+                            test_idx <- idx[(m - 114):m]
+                            
+                            train_x <- x[train_idx]
+                            raw_train_y <- y[train_idx]
+                            test_x <- x[test_idx]
+                            raw_test_y <- y[test_idx]
+                            
+                            train_clean <- clean_data(train_x, raw_train_y)
+                            train_x <- train_clean$x
+                            raw_train_y <- train_clean$y
+                            
+                            raw_fit <- smooth.spline(train_x, raw_train_y, cv = FALSE)
+                            raw_pred_y <- predict(raw_fit, train_x)$y
+                            raw_residuals <- raw_train_y - raw_pred_y
+                            fit_var <- gam(raw_residuals^2 ~ s(train_x), family = Gamma(link = "log"))
+                            var_list <- predict(fit_var, newdata = data.frame(train_x = train_x), type = "response")
+                            var_list <- pmax(var_list, 1e-4)
+                            transform_y <- raw_train_y / sqrt(var_list)
+                            
+                            transform_clean <- clean_data(train_x, transform_y)
+                            train_x <- transform_clean$x
+                            train_y <- transform_clean$y
+                            
+                            fit <- smooth.spline(train_x, train_y, cv = FALSE)
+                            residuals <- predict(fit, train_x)$y - train_y
+                            B <- bs(train_x, df = max(fit$df), 3)
+                            D <- diff(diag(ncol(B)), differences = 2)
+                            S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+                            smoother_matrix <- B %*% S_inv %*% t(B)
+                            I_n <- diag(length(train_x))
+                            residual_matrix <- I_n - smoother_matrix
+                            
+                            estimated_variance <- (t(residuals) %*% residuals) / sum(diag(t(residual_matrix) %*% residual_matrix))
+                            
+                            numerator <- sum(diag(t(residual_matrix) %*% residual_matrix))^2
+                            denominator <- sum(diag((t(residual_matrix) %*% residual_matrix)^2))
+                            nu <- numerator / denominator
+                            
+                            norm_lx_h_values <- apply(smoother_matrix, 2, compute_norm)
+                            rounded_nlh <- round(norm_lx_h_values, 5)
+                            
+                            missing_nlh <- setdiff(rounded_nlh, names(k_lookup_mem))
+                            if (length(missing_nlh) > 0) {
+                              new_k <- mclapply(missing_nlh, function(nlh) {
+                                find_k_factor_fast(nu = nu, norm_lx_h = as.numeric(nlh))
+                              }, mc.cores = 1)
+                              names(new_k) <- missing_nlh
+                              k_lookup_mem <- c(k_lookup_mem, new_k)
+                              saveRDS(k_lookup_mem, paste0(var_name, "_k_lookup_saved.rds"))
+                            }
+                            
+                            k_factors <- as.numeric(unlist(k_lookup_mem[as.character(rounded_nlh)]))
+                            
+                            pred_y <- predict(fit, train_x)$y
+                            TI_upper <- pred_y + k_factors * as.numeric(estimated_variance)
+                            TI_lower <- pred_y - k_factors * as.numeric(estimated_variance)
+                            raw_TI_upper <- TI_upper * sqrt(var_list)
+                            raw_TI_lower <- TI_lower * sqrt(var_list)
+                            
+                            TI_lower_df <- aggregate(raw_TI_lower ~ train_x, FUN = mean)
+                            TI_upper_df <- aggregate(raw_TI_upper ~ train_x, FUN = mean)
+                            interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$raw_TI_lower, xout = test_x)$y
+                            interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$raw_TI_upper, xout = test_x)$y
+                            
+                            is_covered <- as.numeric(raw_test_y >= interp_lower & raw_test_y <= interp_upper)
+                            coverage_flag <- mean(is_covered, na.rm = TRUE) >= 0.90
+                            nmpiw <- mean(interp_upper - interp_lower, na.rm = TRUE)
+                            
+                            return(c(covered = coverage_flag, nmpiw = nmpiw))
+                          }
+  
+  covered_list <- seed_results[, "covered"]
+  nmpiw_list <- seed_results[, "nmpiw"]
+  
+  results[[var_name]] <- list(
+    pct_covered90 = mean(covered_list),
+    mean_nmpiw = mean(nmpiw_list)
+  )
+  
+  cat(sprintf("📌 %s 결과 → 90%% 이상 커버된 비율: %.3f, 평균 NMPIW: %.4f\n",
+              var_name, mean(covered_list), mean(nmpiw_list)))
+}
+
+
+
+
+
+print(results)
+
+results_df <- do.call(rbind, lapply(names(results), function(name) {
+  cbind(variable = name,
+        mean_picp = results[[name]]$mean_picp,
+        mean_nmpiw = results[[name]]$mean_nmpiw)
+}))
+results_df <- as.data.frame(results_df)
+results_df$mean_picp <- as.numeric(results_df$mean_picp)
+results_df$mean_nmpiw <- as.numeric(results_df$mean_nmpiw)
+
+print(results_df)
