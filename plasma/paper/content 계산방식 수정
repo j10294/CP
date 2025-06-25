@@ -314,10 +314,11 @@ for (var_name in target_vars) {
                             TI_upper_df <- aggregate(raw_TI_upper ~ train_x, FUN = mean)
                             interp_lower <- approx(x = TI_lower_df$train_x, y = TI_lower_df$raw_TI_lower, xout = test_x)$y
                             interp_upper <- approx(x = TI_upper_df$train_x, y = TI_upper_df$raw_TI_upper, xout = test_x)$y
-                            
+
+                            y_range <- max(raw_test_y) - min(raw_test_y)
                             is_covered <- as.numeric(raw_test_y >= interp_lower & raw_test_y <= interp_upper)
                             coverage_flag <- mean(is_covered, na.rm = TRUE) >= 0.90
-                            nmpiw <- mean(interp_upper - interp_lower, na.rm = TRUE)
+                            nmpiw <- mean(interp_upper - interp_lower, na.rm = TRUE)/y_range
                             
                             return(c(covered = coverage_flag, nmpiw = nmpiw))
                           }
