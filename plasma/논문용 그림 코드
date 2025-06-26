@@ -1,0 +1,71 @@
+# 합쳐서 그리기
+
+pointwise_df_hoeffding <- read.csv('pointwise_coverage_results_hoeffding.csv') 
+pointwise_df_paper<- read.csv('pointwise_coverage_results_paper.csv') 
+
+# Method 변수 추가
+pointwise_df_hoeffding <- pointwise_df_hoeffding[, !(names(pointwise_df_hoeffding) %in% "na_proportion")]
+pointwise_df_hoeffding$Method <- "Ours"
+pointwise_df_paper$Method <- "GY"
+
+# 두 결과 합치기
+combined_df <- rbind(pointwise_df_hoeffding, pointwise_df_paper)
+
+# 비교 플롯
+library(ggplot2)
+
+library(tikzDevice)
+
+
+# 범례 순서 명시 (Ours가 먼저)
+combined_df$Method <- factor(combined_df$Method, levels = c("Ours", "GY"))
+
+# 선 그래프
+library(ggplot2)
+library(dplyr)
+
+# 샘플 사이즈만 숫자만 남기기 위한 labeller 함수
+custom_labeller <- function(variable, value) {
+  if (variable == "SampleSize") {
+    return(as.character(value))  # "50", "100", ...
+  } else {
+    return(paste(variable, value, sep = ": "))  # 그대로 둠
+  }
+}
+
+# Method를 factor로 설정 (순서 고정)
+combined_df$Method <- factor(combined_df$Method, levels = c("Ours", "GY"))
+
+
+tikz("coverage_plot.tex", width = 6.5, height = 4.5, standAlone = FALSE)
+# SampleSize 라벨 숫자만 보이도록 (factor label 정리)
+combined_df$SampleSize <- factor(combined_df$SampleSize,
+                                 levels = c(50, 100, 200, 500, 1000),
+                                 labels = c("50", "100", "200", "500", "1000"))
+
+# Plot 그리기
+ggplot(combined_df, aes(x = x, y = coverage, color = Method)) +
+  geom_line(size = 0.3) +  # 둘 다 선
+  facet_grid(Model ~ SampleSize, labeller = label_both) +  # 나중에 label_both -> 그냥 label_value 써도 돼
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "black") +
+  scale_y_continuous(breaks = NULL) +  # y축 숫자 제거
+  labs(
+    x = "x",
+    y = "Coverage",
+    color = NULL
+  ) +
+  theme_bw(base_size = 9) +  # 전체적으로 글자 크기 작게
+  theme(
+    strip.text.x = element_text(size = 7),
+    strip.text.y = element_text(size = 6),
+    strip.background = element_blank(),   # ✅ 박스 배경 제거!
+    axis.text.x = element_text(size = 6),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_line(size = 0.3),
+    legend.text = element_text(size = 8),
+    legend.position = "top"
+  )
+
+
+dev.off()
