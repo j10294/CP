@@ -3,7 +3,8 @@ library(mgcv)
 library(MASS)
 
 # --- 데이터 생성 ---
-generate_data <- function(n = 1000) {
+set.seed(123)
+generate_data <- function(n = 2000) {
   x <- runif(n = n, min = -5, max = 5)
   y <- ifelse(abs(x) <= 4.5, cos(pi * x / 10) * rnorm(n, 0, 1), 2 * rnorm(n, 0, 1))
   return(data.frame(x = x, y = y))
@@ -203,30 +204,37 @@ ours_upper_exponential <- pred_seq + sqrt(var_seq) * lambda_exponential
 ours_lower_exponential <- pred_seq - sqrt(var_seq) * lambda_exponential
 
 ours_upper <- pred_seq + sqrt(var_seq)* lambda_hat
-ours_lower <- pred_seq + sqrt(var_seq) * lambda_hat
+ours_lower <- pred_seq - sqrt(var_seq) * lambda_hat
 
 
 # --- Truth 계산 ---
 truth <- compute_truth_interval(x_seq)
 
 
-# --- GY 방법 tolerance interval 계산 (calibration 기반) ---
-# 전체 spline (시각화용)
-pred_y <- predict(fit, x_seq)$y
-grad_y <- predict(fit, x_seq, deriv = 1)$y
-norm_lx_h_values <- abs(grad_y)
+# --- GY 방법 tolerance interval 계산 (transformation function 이용) ---
+x <- data$x
+y <- data$y
+residuals <- y - predict(fit, x)$y
+log_variance_fit <- smooth.spline(x, log(residuals^2 + 1e-6), cv = FALSE)
+variance_hat <- exp(predict(log_variance_fit, x)$y)
 
-# calibration residuals 기반 자유도 및 분산
-B <- bs(cal_x, df = fit$df)
+transform_y <- y / sqrt(variance_hat)
+fit_trans <- smooth.spline(x, transform_y, cv = FALSE)
+
+B <- bs(x, df = fit_trans$df)
 D <- diff(diag(ncol(B)), differences = 2)
-S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
 S <- B %*% S_inv %*% t(B)
-R <- diag(length(cal_x)) - S
-residuals2 <- cal_y - predict(fit, cal_x)$y
+I_n <- diag(length(x))
+R <- I_n - S
+
+residuals2 <- transform_y - predict(fit_trans, x)$y
 est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
 num <- sum(diag(t(R) %*% R))^2
 den <- sum(diag((t(R) %*% R)^2))
 nu <- num / den
+
+norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
 
 # k-factor 계산
 k_factors <- sapply(norm_lx_h_values, function(nlh) {
@@ -234,31 +242,45 @@ k_factors <- sapply(norm_lx_h_values, function(nlh) {
   if (is.na(k)) find_k_factor(nu, nlh) else k
 })
 
-gy_upper <- pred_seq + sqrt(est_var) * k_factors
-gy_lower <- pred_seq - sqrt(est_var) * k_factors
+pred_seq <- predict(fit_trans, x_seq)$y
+cal_idx <- match(cal_x, data$x)
+gy_upper <- ( pred_seq + sqrt(as.vector(est_var)) * k_factors[cal_idx] ) * sqrt(variance_hat[cal_idx])
+gy_lower <- ( pred_seq - sqrt(as.vector(est_var)) * k_factors[cal_idx] ) * sqrt(variance_hat[cal_idx])
 
 
-# --- 시각화 ---
-plot(data$x, data$y, pch = 20, col = "gray", main = "Tolerance Interval Comparison", xlab = "x", ylab = "y")
+# --- 시각화 및 컴파일---
+plot(data$x, data$y, pch = 20, col = "gray", main = "Tolerance Interval Comparison", xlab = "x", ylab = "y", 
+     ylim=c(-10, 10))
 
 # Truth
 lines(x_seq, truth$upper, col = "black", lwd = 2, lty = "solid")
 lines(x_seq, truth$lower, col = "black", lwd = 2, lty = "solid")
 
+# Ours 
+lines(x_seq, ours_upper, col = "#E69F00", lwd = 2, lty = "solid")
+lines(x_seq, ours_lower, col = "#E69F00", lwd = 2, lty = "solid")
+
 # Ours (Gaussian)
-lines(x_seq, ours_upper_gaussian, col = "darkgreen", lwd = 2, lty = "dotted")
-lines(x_seq, ours_lower_gaussian, col = "darkgreen", lwd = 2, lty = "dotted")
+lines(x_seq, ours_upper_gaussian, col = "#009E73", lwd = 2, lty = "solid")
+lines(x_seq, ours_lower_gaussian, col = "#009E73", lwd = 2, lty = "solid")
 
 # Ours (Exponential)
-lines(x_seq, ours_upper_exponential, col = "orange", lwd = 2, lty = "dotdash")
-lines(x_seq, ours_lower_exponential, col = "orange", lwd = 2, lty = "dotdash")
+lines(x_seq, ours_upper_exponential, col = "#56B4E9", lwd = 2, lty = "solid")
+lines(x_seq, ours_lower_exponential, col = "#56B4E9", lwd = 2, lty = "solid")
 
 # GY
-lines(x_seq, gy_upper, col = "blue", lwd = 2, lty = "dashed")
-lines(x_seq, gy_lower, col = "blue", lwd = 2, lty = "dashed")
+lines(x_seq, gy_upper, col = "#CC79A7", lwd = 0.5, lty = "solid")
+lines(x_seq, gy_lower, col = "#CC79A7", lwd = 0.5, lty = "solid")
 
+# --- 범례 추가 ---
 legend("topright",
-       legend = c("Truth", "Ours-Gaussian", "Ours-Exponential", "GY"),
-       col = c("black", "darkgreen", "orange", "blue"),
-       lty = c("solid", "dotted", "dotdash", "dashed"),
-       lwd = 2)
+       legend = c("Truth", "Ours", "Ours (Gaussian)", "Ours (Exponential)", "GY"),
+       col = c("black", "#E69F00", "#009E73", "#56B4E9", "#CC79A7"),
+       lwd = 2,
+       lty = rep("solid", 5),
+       cex = 0.8)
+
+
+
+pdf("tolerance_interval_comparison.pdf", width = 12, height = 12)
+dev.off()
