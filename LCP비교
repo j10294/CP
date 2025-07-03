@@ -1,0 +1,264 @@
+library(splines)
+library(mgcv)
+library(MASS)
+
+# --- 데이터 생성 ---
+generate_data <- function(n = 1000) {
+  x <- runif(n = n, min = -5, max = 5)
+  y <- ifelse(abs(x) <= 4.5, cos(pi * x / 10) * rnorm(n, 0, 1), 2 * rnorm(n, 0, 1))
+  return(data.frame(x = x, y = y))
+}
+
+# --- Truth Tolerance Interval ---
+compute_truth_interval <- function(x_seq) {
+  sd_vals <- ifelse(abs(x_seq) <= 4.5, abs(cos(pi * x_seq / 10)), 2)
+  list(lower = -1.645 * sd_vals, upper = 1.645 * sd_vals)
+}
+
+# --- Ours 방법 λ 계산 ---
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n,
+                            lower = 0, upper = 30, step = 1e-3) {
+  
+  threshold <- alpha - sqrt(log(1/delta) / (2*n))
+  threshold <- max(0, threshold) #truncation
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    # empirical risk 계산
+    risk <- mean(
+      y <= pred - sqrt(variance) * lambda |
+        y >= pred + sqrt(variance) * lambda,
+      na.rm = TRUE
+    )
+    
+    # 조건을 만족하는 가장 첫 λ 반환
+    if (risk <= threshold) {
+      return(lambda)
+    }
+  }
+  
+  # 조건 만족하는 lambda가 없을 경우
+  return(NA)
+}
+
+find_lambda_hat_weighted <- function(alpha, delta, y, pred, variance, n,
+                                     lower = 0, upper = 30, step = 1e-3,
+                                     weights = NULL) {
+  threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
+  threshold <- max(0, threshold)
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    indicator <- (y <= pred - sqrt(variance) * lambda |
+                    y >= pred + sqrt(variance) * lambda)
+    
+    risk <- if (is.null(weights)) {
+      mean(indicator, na.rm = TRUE)
+    } else {
+      weights <- weights / sum(weights, na.rm = TRUE)
+      sum(weights * indicator, na.rm = TRUE)
+    }
+    
+    if (risk <= threshold) return(lambda)
+  }
+  return(NA)
+}
+
+# --- weight 계산 (Gaussian / Exponential) ---
+compute_weights <- function(x_cal, x0,
+                            h0 = 0.5, target_eff = 50, max_h = 3,
+                            kernel = c("gaussian", "exponential")) {
+  kernel <- match.arg(kernel)
+  dist <- abs(x_cal - x0)
+  h <- h0
+  
+  repeat {
+    w_raw <- if (kernel == "gaussian") exp(-dist^2 / h^2) else exp(-dist / h)
+    w <- w_raw / sum(w_raw)
+    n_eff <- 1 / sum(w^2)
+    
+    if (n_eff >= target_eff || h >= max_h) break
+    h <- h * 1.5
+  }
+  
+  return(w)
+}
+
+# --- GY 방법 관련 함수들 ---
+compute_norm <- function(vector) sqrt(sum(vector^2))
+
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    out <- numeric(length(q_val))
+    
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      l <- lhs[i]
+      if (is.nan(q) || is.nan(l) || is.na(q) || is.na(l)) { out[i] <- 0; next }
+      
+      if (l <= k^2) {
+        threshold <- (nu * q) / (k^2)
+        prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+        out[i] <- ifelse(is.nan(prob) || is.na(prob), 1e-6, prob)
+      } else out[i] <- 0
+    }
+    return(out)
+  }, error = function(e) rep(0, length(t)))
+}
+
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  if (log(exp_term) < -20) return(1e-10)
+  return(exp_term * prob_term)
+}
+
+find_upper_bound_t <- function(k, nu, P) {
+  t_seq <- seq(0.01, 20, by = 0.1)
+  valid_t <- sapply(t_seq, function(t) {
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    lhs <- q_val / ((t * sqrt(5 / nu)) + 1)
+    return(length(lhs) == 1 && !is.na(lhs) && lhs <= k^2)
+  })
+  if (any(valid_t)) return(max(t_seq[valid_t]))
+  warning("조건을 만족하는 t가 없음 — fallback to t = 15")
+  return(15)
+}
+
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(k, nu, P)
+    if (is.na(upper_bound) || is.infinite(upper_bound)) return(1e6)
+    integral_result <- integrate(Vectorize(integrand), lower = 0, upper = upper_bound,
+                                 k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+    final_val <- pi_term * integral_result
+    return(abs(final_val - gamma))
+  }
+  tryCatch(optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum,
+           error = function(e) NA)
+}
+
+# --- 데이터 생성 및 샘플링 ---
+set.seed(123)
+data <- generate_data()
+m <- nrow(data)
+n_train <- m / 2
+n_cal <- m / 2
+alpha <- 0.10
+delta <- 0.05
+
+all_indices <- sample(m)
+train_index <- all_indices[1:n_train]
+cal_index <- all_indices[(n_train + 1):m]
+
+train_x <- data$x[train_index]
+train_y <- data$y[train_index]
+cal_x <- data$x[cal_index]
+cal_y <- data$y[cal_index]
+
+# --- Spline 학습 및 분산 추정 (calibration 기반) ---
+fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+pred_y_cal <- predict(fit, cal_x)$y
+residuals_cal <- cal_y - pred_y_cal
+log_res2 <- log(residuals_cal^2 + 1e-6)
+gam_model <- gam(log_res2 ~ s(cal_x))
+variance_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = cal_x)))
+
+# ours 방법 계산 (Gaussian / Exponential)
+alpha <- 0.10
+delta <- 0.05
+x_seq <- sort(cal_x)
+
+lambda_gaussian <- sapply(x_seq, function(x0) {
+  w <- compute_weights(cal_x, x0, kernel = "gaussian")
+  pred <- predict(fit, x0)$y
+  var_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = x0)))
+  find_lambda_hat_weighted(alpha, delta, cal_y, rep(pred, length(cal_y)),
+                           rep(var_hat, length(cal_y)), length(cal_y), weights = w)
+})
+
+lambda_exponential <- sapply(x_seq, function(x0) {
+  w <- compute_weights(cal_x, x0, kernel = "exponential")
+  pred <- predict(fit, x0)$y
+  var_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = x0)))
+  find_lambda_hat_weighted(alpha, delta, cal_y, rep(pred, length(cal_y)),
+                           rep(var_hat, length(cal_y)), length(cal_y), weights = w)
+})
+
+
+lambda_hat <- find_lambda_hat(alpha, delta, cal_y, pred_y_cal, variance_hat, n_cal)
+
+pred_seq <- predict(fit, x_seq)$y
+var_seq <- exp(predict(gam_model, newdata = data.frame(cal_x = x_seq)))
+
+ours_upper_gaussian <- pred_seq + sqrt(var_seq) * lambda_gaussian
+ours_lower_gaussian <- pred_seq - sqrt(var_seq) * lambda_gaussian
+
+ours_upper_exponential <- pred_seq + sqrt(var_seq) * lambda_exponential
+ours_lower_exponential <- pred_seq - sqrt(var_seq) * lambda_exponential
+
+ours_upper <- pred_seq + sqrt(var_seq)* lambda_hat
+ours_lower <- pred_seq + sqrt(var_seq) * lambda_hat
+
+
+# --- Truth 계산 ---
+truth <- compute_truth_interval(x_seq)
+
+
+# --- GY 방법 tolerance interval 계산 (calibration 기반) ---
+# 전체 spline (시각화용)
+pred_y <- predict(fit, x_seq)$y
+grad_y <- predict(fit, x_seq, deriv = 1)$y
+norm_lx_h_values <- abs(grad_y)
+
+# calibration residuals 기반 자유도 및 분산
+B <- bs(cal_x, df = fit$df)
+D <- diff(diag(ncol(B)), differences = 2)
+S_inv <- ginv(t(B) %*% B + fit$lambda * t(D) %*% D)
+S <- B %*% S_inv %*% t(B)
+R <- diag(length(cal_x)) - S
+residuals2 <- cal_y - predict(fit, cal_x)$y
+est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+num <- sum(diag(t(R) %*% R))^2
+den <- sum(diag((t(R) %*% R)^2))
+nu <- num / den
+
+# k-factor 계산
+k_factors <- sapply(norm_lx_h_values, function(nlh) {
+  k <- find_k_factor(nu, nlh)
+  if (is.na(k)) find_k_factor(nu, nlh) else k
+})
+
+gy_upper <- pred_seq + sqrt(est_var) * k_factors
+gy_lower <- pred_seq - sqrt(est_var) * k_factors
+
+
+# --- 시각화 ---
+plot(data$x, data$y, pch = 20, col = "gray", main = "Tolerance Interval Comparison", xlab = "x", ylab = "y")
+
+# Truth
+lines(x_seq, truth$upper, col = "black", lwd = 2, lty = "solid")
+lines(x_seq, truth$lower, col = "black", lwd = 2, lty = "solid")
+
+# Ours (Gaussian)
+lines(x_seq, ours_upper_gaussian, col = "darkgreen", lwd = 2, lty = "dotted")
+lines(x_seq, ours_lower_gaussian, col = "darkgreen", lwd = 2, lty = "dotted")
+
+# Ours (Exponential)
+lines(x_seq, ours_upper_exponential, col = "orange", lwd = 2, lty = "dotdash")
+lines(x_seq, ours_lower_exponential, col = "orange", lwd = 2, lty = "dotdash")
+
+# GY
+lines(x_seq, gy_upper, col = "blue", lwd = 2, lty = "dashed")
+lines(x_seq, gy_lower, col = "blue", lwd = 2, lty = "dashed")
+
+legend("topright",
+       legend = c("Truth", "Ours-Gaussian", "Ours-Exponential", "GY"),
+       col = c("black", "darkgreen", "orange", "blue"),
+       lty = c("solid", "dotted", "dotdash", "dashed"),
+       lwd = 2)
