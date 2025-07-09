@@ -1,0 +1,374 @@
+library(splines)
+library(mgcv)
+library(MASS)
+
+# --- 데이터 생성 ---
+set.seed(123)
+generate_data <- function(n = 2000) {
+  x <- runif(n = n, min = -5, max = 5)
+  y <- ifelse(abs(x) <= 4.5, cos(pi * x / 10) * rnorm(n, 0, 1), 
+              2 * rnorm(n, 0, 1))
+  return(data.frame(x = x, y = y))
+}
+
+# --- Truth Tolerance Interval ---
+compute_truth_interval <- function(x_seq) {
+  sd_vals <- ifelse(abs(x_seq) <= 4.5, abs(cos(pi * x_seq / 10)), 2)
+  list(lower = -1.645 * sd_vals, upper = 1.645 * sd_vals)
+}
+
+# --- Ours 방법 λ 계산 ---
+find_lambda_hat <- function(alpha, delta, y, pred, variance, n,
+                            lower = 0, upper = 30, step = 1e-3) {
+  
+  threshold <- alpha - sqrt(log(1/delta) / (2*n))
+  threshold <- max(0, threshold) #truncation
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    # empirical risk 계산
+    risk <- mean(
+      y <= pred - sqrt(variance) * lambda |
+        y >= pred + sqrt(variance) * lambda,
+      na.rm = TRUE
+    )
+    
+    # 조건을 만족하는 가장 첫 λ 반환
+    if (risk <= threshold) {
+      return(lambda)
+    }
+  }
+  
+  # 조건 만족하는 lambda가 없을 경우
+  return(NA)
+}
+
+find_lambda_hat_weighted <- function(alpha, delta, y, pred, variance, n,
+                                     lower = 0, upper = 30, step = 1e-3,
+                                     weights = NULL) {
+  threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
+  threshold <- max(0, threshold)
+  
+  lambda_seq <- seq(lower, upper, by = step)
+  
+  for (lambda in lambda_seq) {
+    indicator <- (y <= pred - sqrt(variance) * lambda |
+                    y >= pred + sqrt(variance) * lambda)
+    
+    risk <- if (is.null(weights)) {
+      mean(indicator, na.rm = TRUE)
+    } else {
+      weights <- weights / sum(weights, na.rm = TRUE)
+      sum(weights * indicator, na.rm = TRUE)
+    }
+    
+    if (risk <= threshold) return(lambda)
+  }
+  return(NA)
+}
+
+find_lambda_hat_nabc<- function(alpha, delta, y, pred, variance, n,
+                                lower = 0, upper = 30, step = 1e-3,
+                                weights = NULL,
+                                max_iter = 5, damping = 0.5) {
+  threshold <- alpha - sqrt(log(1 / delta) / (2 * n))
+  threshold <- max(0, threshold)
+  
+  compute_risk <- function(lambda_1, lambda_2) {
+    indicator <- (y <= pred - sqrt(variance) * lambda_1 |
+                    y >= pred + sqrt(variance) * lambda_2)
+    if (is.null(weights)) {
+      mean(indicator, na.rm = TRUE)
+    } else {
+      w <- weights / sum(weights, na.rm = TRUE)
+      sum(w * indicator, na.rm = TRUE)
+    }
+  }
+  
+  binary_search <- function(lambda_fixed, side = c("lower", "upper")) {
+    side <- match.arg(side)
+    l <- lower
+    u <- upper
+    while ((u - l) > step) {
+      mid <- (l + u) / 2
+      risk <- if (side == "lower") compute_risk(mid, lambda_fixed)
+      else compute_risk(lambda_fixed, mid)
+      if (risk > threshold) {
+        l <- mid
+      } else {
+        u <- mid
+      }
+    }
+    return((l + u) / 2)
+  }
+  
+  # 초기값
+  lambda_1 <- upper / 2
+  lambda_2 <- upper / 2
+  
+  for (i in 1:max_iter) {
+    new_lambda_1 <- binary_search(lambda_2, side = "lower")
+    lambda_1 <- damping * new_lambda_1 + (1 - damping) * lambda_1
+    
+    new_lambda_2 <- binary_search(lambda_1, side = "upper")
+    lambda_2 <- damping * new_lambda_2 + (1 - damping) * lambda_2
+  }
+  
+  return(c(lambda_1, lambda_2))
+}
+
+
+# --- weight 계산 (Gaussian / Exponential / NABC) ---
+compute_weights <- function(x_cal, x0,
+                            h0 = 0.5, target_eff = 50, max_h = 3,
+                            kernel = c("gaussian", "exponential", "nabc")) {
+  kernel <- match.arg(kernel)
+  dist <- abs(x_cal - x0)
+  h <- h0
+  
+  repeat {
+    w_raw <- if (kernel == "gaussian") {
+      exp(-dist^2 / h^2)
+    } else if (kernel == "nabc") {
+      exp(-h * dist)
+    } else {
+      exp(-dist / h)
+    }
+    
+    w <- if (kernel == 'nabc') { w_raw/(1+sum(w_raw))} else{w_raw / sum(w_raw)}
+    n_eff <- 1 / sum(w^2)
+    
+    if (n_eff >= target_eff || h >= max_h) break
+    h <- if (kernel == 'nabc'){h/1.5} else {h * 1.5} #nabc 는 반대방향으로 설정 
+  }
+  
+  return(w)
+}
+
+# --- GY 방법 관련 함수들 ---
+compute_norm <- function(vector) sqrt(sum(vector^2))
+
+compute_probability <- function(nu, t, P, k, norm_lx_h) {
+  tryCatch({
+    q_val <- qchisq(P, df = 1, ncp = t^2)
+    out <- numeric(length(q_val))
+    for (i in seq_along(q_val)) {
+      q <- q_val[i]
+      if (is.nan(q) || is.na(q)) { out[i] <- 0; next }
+      threshold <- (nu * q) / (k^2)
+      prob <- pchisq(threshold, df = nu, lower.tail = FALSE)
+      out[i] <- ifelse(is.nan(prob) || is.na(prob), 1e-6, prob)
+    }
+    return(out)
+  }, error = function(e) rep(0, length(t)))
+} #prop 3.1 의 Pr부분 계산하는 함수. t값을 받아 확률을 계산함 
+
+integrand <- function(t, k, nu, P, norm_lx_h) {
+  exp_term <- exp(-t^2 / (2 * norm_lx_h^2))
+  prob_term <- compute_probability(nu, t, P, k, norm_lx_h)
+  if (log(exp_term) < -20) return(1e-10) #너무 작으면 -inf이 나오므로 이부분 방지
+  return(exp_term * prob_term)
+}
+
+#적분값의 상한 구하는 함수 수정 
+find_upper_bound_t <- function(norm_lx_h, multiplier = 4) {
+  return(max(multiplier * max(norm_lx_h), 5))
+}
+
+find_k_factor <- function(nu, norm_lx_h, P = 0.90, gamma = 0.95) {
+  obj_func <- function(k) {
+    upper_bound <- find_upper_bound_t(norm_lx_h = norm_lx_h)
+    if (is.na(upper_bound) || is.infinite(upper_bound)) return(1e6)
+    integral_result <- integrate(Vectorize(integrand), lower = 0, upper = upper_bound,
+                                 k = k, nu = nu, P = P, norm_lx_h = norm_lx_h)$value
+    pi_term <- sqrt(2 / (pi * norm_lx_h^2))
+    final_val <- pi_term * integral_result
+    return(abs(final_val - gamma))
+  }
+  tryCatch(optimize(obj_func, interval = c(0.01, 10), tol = 1e-2)$minimum,
+           error = function(e) NA)
+}
+
+
+
+
+
+
+
+
+
+
+
+# --- 데이터 생성 및 샘플링  함수
+# --- 주요 tolerance interval 계산 함수 ---
+compute_tolerance_interval <- function(data, method = c("Ours", "Ours-Gaussian", "Ours-Exponential", "Ours-NABC", "GY"), alpha = 0.10, delta = 0.05, x_seq = NULL) {
+  method <- match.arg(method)
+  
+  # 데이터 및 split
+  set.seed(123)
+  m <- nrow(data)
+  n_train <- m / 2
+  n_cal <- m / 2
+  all_indices <- sample(m)
+  train_index <- all_indices[1:n_train]
+  cal_index <- all_indices[(n_train + 1):m]
+  train_x <- data$x[train_index]
+  train_y <- data$y[train_index]
+  cal_x <- data$x[cal_index]
+  cal_y <- data$y[cal_index]
+  
+  # spline 및 분산 추정
+  fit <- smooth.spline(x = train_x, y = train_y, cv = FALSE)
+  pred_y_cal <- predict(fit, cal_x)$y
+  residuals_cal <- cal_y - pred_y_cal
+  log_res2 <- log(residuals_cal^2 + 1e-6)
+  gam_model <- gam(log_res2 ~ s(cal_x))
+  
+  if (is.null(x_seq)) {
+    x_seq <- sort(cal_x)
+  }
+  
+  pred_seq <- predict(fit, x_seq)$y
+  var_seq <- exp(predict(gam_model, newdata = data.frame(cal_x = x_seq)))
+  
+  # --- 방법별 tolerance interval 계산 ---
+  if (method == "Ours") {
+    lambda_hat <- find_lambda_hat(alpha, delta, cal_y, pred_y_cal, exp(predict(gam_model, newdata = data.frame(cal_x = cal_x))), length(cal_y))
+    lower <- pred_seq - sqrt(var_seq) * lambda_hat
+    upper <- pred_seq + sqrt(var_seq) * lambda_hat
+    
+  } else if (method == "Ours-Gaussian") {
+    lambda_gaussian <- sapply(x_seq, function(x0) {
+      w <- compute_weights(cal_x, x0, kernel = "gaussian")
+      pred <- predict(fit, x0)$y
+      var_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = x0)))
+      find_lambda_hat_weighted(alpha, delta, cal_y, rep(pred, length(cal_y)),
+                               rep(var_hat, length(cal_y)), length(cal_y), weights = w)
+    })
+    lower <- pred_seq - sqrt(var_seq) * lambda_gaussian
+    upper <- pred_seq + sqrt(var_seq) * lambda_gaussian
+    
+  } else if (method == "Ours-Exponential") {
+    lambda_exp <- sapply(x_seq, function(x0) {
+      w <- compute_weights(cal_x, x0, kernel = "exponential")
+      pred <- predict(fit, x0)$y
+      var_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = x0)))
+      find_lambda_hat_weighted(alpha, delta, cal_y, rep(pred, length(cal_y)),
+                               rep(var_hat, length(cal_y)), length(cal_y), weights = w)
+    })
+    lower <- pred_seq - sqrt(var_seq) * lambda_exp
+    upper <- pred_seq + sqrt(var_seq) * lambda_exp
+    
+  } else if (method == "Ours-NABC") {
+    lambda_nabc <- t(sapply(x_seq, function(x0) {
+      w <- compute_weights(cal_x, x0, kernel = "nabc")
+      pred <- predict(fit, x0)$y
+      var_hat <- exp(predict(gam_model, newdata = data.frame(cal_x = x0)))
+      find_lambda_hat_nabc(alpha = alpha, delta = delta, y = cal_y,
+                           pred = rep(pred, length(cal_y)),
+                           variance = rep(var_hat, length(cal_y)),
+                           n = length(cal_y),
+                           weights = w)
+    }))
+    lower <- pred_seq - sqrt(var_seq) * lambda_nabc[, 1]
+    upper <- pred_seq + sqrt(var_seq) * lambda_nabc[, 2]
+    
+  } else if (method == "GY") {
+    # GY 방법 전체 데이터 사용
+    x <- data$x
+    y <- data$y
+    residuals <- y - predict(fit, x)$y
+    log_variance_fit <- smooth.spline(x, log(residuals^2 + 1e-6), cv = FALSE)
+    variance_hat <- exp(predict(log_variance_fit, x)$y)
+    
+    transform_y <- y / sqrt(variance_hat)
+    fit_trans <- smooth.spline(x, transform_y, cv = FALSE)
+    
+    B <- bs(x, df = fit_trans$df)
+    D <- diff(diag(ncol(B)), differences = 2)
+    S_inv <- ginv(t(B) %*% B + fit_trans$lambda * t(D) %*% D)
+    S <- B %*% S_inv %*% t(B)
+    I_n <- diag(length(x))
+    R <- I_n - S
+    
+    residuals2 <- transform_y - predict(fit_trans, x)$y
+    est_var <- (t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R))
+    num <- sum(diag(t(R) %*% R))^2
+    den <- sum(diag((t(R) %*% R)^2))
+    nu <- num / den
+    
+    norm_lx_h_values <- sapply(1:ncol(S), function(j) compute_norm(S[, j]))
+    k_factors <- sapply(norm_lx_h_values, function(nlh) {
+      k <- find_k_factor(nu, nlh)
+      if (is.na(k)) find_k_factor(nu, nlh) else k
+    })
+    
+    pred_seq <- predict(fit_trans, x_seq)$y
+    cal_idx <- match(x_seq, data$x)
+    # x_seq 값이 data$x에 없을 경우 보간 필요
+    if (any(is.na(cal_idx))) {
+      stop("x_seq 값이 data$x에 포함되어야 합니다 (GY 방법).")
+    }
+    variance_seq <- variance_hat[cal_idx]
+    
+    lower <- (pred_seq - sqrt(as.vector(est_var)) * k_factors[cal_idx]) * sqrt(variance_seq)
+    upper <- (pred_seq + sqrt(as.vector(est_var)) * k_factors[cal_idx]) * sqrt(variance_seq)
+  }
+  
+  return(list(x = x_seq, lower = lower, upper = upper))
+}
+
+
+
+
+# 데이터 생성
+data <- generate_data()
+
+# ours-Gaussian 방법으로 계산
+result_gaussian <- compute_tolerance_interval(data, method = "Ours-Gaussian")
+result_exp <- compute_tolerance_interval(data, method='Ours-Exponential')
+result_ours <- compute_tolerance_interval(data, method='Ours')
+result_nabc <- compute_tolerance_interval(data, method='Ours-NABC')
+result_GY <- compute_tolerance_interval(data, method='GY')
+
+# content 계산 함수
+compute_content <- function(lower, upper, x, y) {
+  mean(y >= approx(x, lower, xout = x)$y &
+         y <= approx(x, upper, xout = x)$y)
+}
+
+# Truth interval (참값 구간)
+truth <- compute_truth_interval(data$x)
+
+# ours-Gaussian content 계산
+content_gaussian <- compute_content(result_gaussian$lower, result_gaussian$upper, result_gaussian$x, data$y)
+
+# ours-Exponential content 계산
+content_exp <- compute_content(result_exp$lower, result_exp$upper, result_exp$x, data$y)
+
+# ours content 계산
+content_ours <- compute_content(result_ours$lower, result_ours$upper, result_ours$x, data$y)
+
+# ours-NABC content 계산
+content_nabc <- compute_content(result_nabc$lower, result_nabc$upper, result_nabc$x, data$y)
+
+# GY content 계산
+content_GY <- compute_content(result_GY$lower, result_GY$upper, result_GY$x, data$y)
+
+# Truth content 계산 (참고용)
+content_truth <- compute_content(truth$lower, truth$upper, data$x, data$y)
+
+# 결과 출력
+cat("Ours (Gaussian):", round(content_gaussian, 3), "\n")
+cat("Ours (Exponential):", round(content_exp, 3), "\n")
+cat("Ours:", round(content_ours, 3), "\n")
+cat("Ours (NABC):", round(content_nabc, 3), "\n")
+cat("GY:", round(content_GY, 3), "\n")
+cat("Truth:", round(content_truth, 3), "\n")
+
+
+# plot
+plot(data$x, data$y,  main = "Tolerance Interval")
+lines(result$x, result$lower, type = "l", col = "blue")
+lines(result$x, result$upper, col = "blue")
