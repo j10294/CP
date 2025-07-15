@@ -1,0 +1,121 @@
+library(splines)
+library(mgcv)
+library(MASS)
+library(progressr)
+library(foreach)
+library(doParallel)
+
+
+# --- 데이터 생성 ---
+set.seed(123)
+generate_data <- function(n = 2000) {
+  x <- runif(n = n, min = -5, max = 5)
+  y <- ifelse(abs(x) <= 4.5, cos(pi * x / 10) * rnorm(n, 0, 1), 
+              2 * rnorm(n, 0, 1))
+  return(data.frame(x = x, y = y))
+}
+data <- generate_data()
+idx <- sample(length(data$x))
+train_index <- idx[1:1000]; cal_index <- idx[1001:2000]
+train_x <- data$x[train_index]
+train_y <- data$y[train_index]
+cal_x <- data$x[cal_index]
+cal_y <- data$y[cal_index]
+
+# 1. 모델 훈련 
+fit <- smooth.spline(x=train_x, y=train_y)
+residual <- predict(fit,train_x)$y - train_y
+plot(train_x[order(train_x)],abs(residual))
+
+variance_fit <- smooth.spline(x=train_x, y=abs(residual)) ; 
+lines(train_x[order(train_x)],
+      predict(variance_fit, train_x[order(train_x)])$y,
+      col = "blue", lwd = 2)
+
+# 2. calibration data 에 대한 conformal score 계산
+nonconformal_score <- function(x, y) {
+  res <- abs(y - predict(fit, x)$y)
+  uncert <- predict(variance_fit, x)$y
+  - res / uncert
+}
+
+
+# 3. 각 x에 대해 CP prediction set 계산
+alpha <- 0.1
+n <- length(cal_x)
+delta <- 0.05
+E <- 0.1
+epsilon <- E - sqrt(log(1 / delta) / (2 * n))
+
+# y 후보값
+y_list <- seq(min(train_y), max(train_y), by = 0.01)
+
+# 결과를 저장할 리스트
+CP_sets <- list()
+
+# 모든 calibration 샘플에 대한 nonconformal score 계산
+nonconformal_scores <- sapply(1:n, function(k) {
+  nonconformal_score(cal_x[k], cal_y[k])
+})
+
+# test_x list
+test_x_list <- seq(-5, 5, by = 0.1)
+
+
+for (i in seq_along(test_x_list)) {
+  test_x <- test_x_list[i]
+  y_in_set <- c()
+  
+  for (j in seq_along(y_list)) {
+    y <- y_list[j]
+    
+    # test point (x, y)에 대한 nonconformal score
+    test_score <- nonconformal_score(test_x, y)
+    
+    # p-value 계산
+    py <- (sum(nonconformal_scores <= test_score) + 1) / (n + 1)
+    
+    # Inclusion criterion
+    if (py > alpha) {
+      y_in_set <- c(y_in_set, y)
+    }
+  }
+  
+  CP_sets[[i]] <- y_in_set
+}
+
+# 시각화 
+df_plot <- data.frame(
+  x = test_x_list,
+  lower = sapply(CP_sets, function(ys) if (length(ys) > 0) min(ys) else NA),
+  upper = sapply(CP_sets, function(ys) if (length(ys) > 0) max(ys) else NA)
+)
+
+z <- qnorm(0.95)
+mu_x <- cos(pi * df_plot$x / 10)
+sigma_x <- ifelse(abs(df_plot$x) <= 4.5, abs(mu_x), 2)
+
+# 진짜 구간 계산
+truth_lower <- -sigma_x  # 부호 주의!
+truth_upper <- sigma_x
+
+# df에 추가
+df_plot$truth_lower <- truth_lower
+df_plot$truth_upper <- truth_upper
+
+# 시각화
+library(ggplot2)
+
+ggplot(df_plot, aes(x = x)) +
+  # CP prediction set (구한 것)
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "skyblue", alpha = 0.4) +
+  geom_line(aes(y = lower), color = "blue", linetype = "dashed") +
+  geom_line(aes(y = upper), color = "blue", linetype = "dashed") +
+  
+  # Ground truth (진짜 90% 구간)
+  geom_line(aes(y = truth_lower), color = "black", size = 1) +
+  geom_line(aes(y = truth_upper), color = "black", size = 1) +
+  
+  labs(title = "Conformal Prediction Set vs Truth Interval (90%)",
+       x = "x", y = "y") +
+  theme_minimal()
