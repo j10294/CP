@@ -32,8 +32,8 @@ lines(train_x[order(train_x)],
       predict(variance_fit, train_x[order(train_x)])$y,
       col = "blue", lwd = 2)
 
-# 2. calibration data 에 대한 conformal score 계산
-nonconformal_score <- function(x, y) {
+# 2. calibration data 에 대한 conformal score 계산 (클수록 모델이 더 잘 예측함을 의미함)
+conformal_score <- function(x, y) {
   res <- abs(y - predict(fit, x)$y)
   uncert <- predict(variance_fit, x)$y
   - res / uncert
@@ -53,9 +53,9 @@ y_list <- seq(min(train_y), max(train_y), by = 0.01)
 # 결과를 저장할 리스트
 CP_sets <- list()
 
-# 모든 calibration 샘플에 대한 nonconformal score 계산
-nonconformal_scores <- sapply(1:n, function(k) {
-  nonconformal_score(cal_x[k], cal_y[k])
+# 모든 calibration 샘플에 대한 conformal score 계산
+conformal_scores <- sapply(1:n, function(k) {
+  conformal_score(cal_x[k], cal_y[k])
 })
 
 # test_x list
@@ -69,11 +69,11 @@ for (i in seq_along(test_x_list)) {
   for (j in seq_along(y_list)) {
     y <- y_list[j]
     
-    # test point (x, y)에 대한 nonconformal score
-    test_score <- nonconformal_score(test_x, y)
+    # test point (x, y)에 대한 conformal score
+    test_score <- conformal_score(test_x, y)
     
     # p-value 계산
-    py <- (sum(nonconformal_scores <= test_score) + 1) / (n + 1)
+    py <- (sum(conformal_scores <= test_score) + 1) / (n + 1)
     
     # Inclusion criterion
     if (py > alpha) {
