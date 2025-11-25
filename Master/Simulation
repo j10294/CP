@@ -216,6 +216,7 @@ merge_small_clusters <- function(label_clusters, y_cal, m_min = 100) {
 # 5) Lambda selection on selection split
 # ----------------------------
 
+
 choose_lambda_by_selection <- function(
     p_sel,
     y_sel,
@@ -244,8 +245,14 @@ choose_lambda_by_selection <- function(
   cand_lmb <- sort(unique(grid))
   cand     <- lapply(cand_lmb, make_eval)
   
+  # 전체 selection에 대한 평균 set size (overall, 모든 클러스터 공통)
   mean_size_vec <- sapply(cand, function(o) {
     mean(sapply(o$pred_sets, length))
+  })
+  
+  # 전체 selection에 대한 overall coverage (모든 클러스터 공통)
+  cov_overall_vec <- sapply(cand, function(o) {
+    mean(o$covered)
   })
   
   for (cc in seq_len(Kc)) {
@@ -257,28 +264,43 @@ choose_lambda_by_selection <- function(
       next
     }
     
+    # 이 클러스터의 coverage
     cov_cc_vec <- sapply(cand, function(o) {
       mean(o$covered[idx_cc])
     })
     
     eval_tbl <- tibble::tibble(
-      lambda    = cand_lmb,
-      mean_size = mean_size_vec,
-      cov_cc    = cov_cc_vec
+      lambda       = cand_lmb,
+      mean_size    = mean_size_vec,
+      cov_cc       = cov_cc_vec,
+      cov_overall  = cov_overall_vec
     )
     
-    # (1) 클러스터 커버리지가 1 - alpha 이상인 후보들 중
-    #     set size 최소(그다음 cov 큰 것) 선택
-    feas <- dplyr::filter(eval_tbl, cov_cc >= (1 - alpha))
+    ## (1) 클러스터 + overall 둘 다 nominal coverage를 만족하는 λ 우선
+    feas <- dplyr::filter(
+      eval_tbl,
+      cov_cc      >= (1 - alpha),
+      cov_overall >= (1 - alpha)
+    )
     
     if (nrow(feas) > 0) {
+      # set size 최소, 그다음 cluster coverage/overall coverage 큰 것 선호
       chosen <- feas %>%
-        dplyr::arrange(mean_size, dplyr::desc(cov_cc)) %>%
+        dplyr::arrange(mean_size,
+                       dplyr::desc(cov_cc),
+                       dplyr::desc(cov_overall)) %>%
         dplyr::slice(1)
     } else {
-      # (2) 그런 λ가 없으면 cov 최대(그다음 size 작은 것) 선택
+      # (2) 그런 λ가 없으면 → coverage 위반량 + set size를 같이 보는 loss 최소 선택
+      eval_tbl <- eval_tbl %>%
+        dplyr::mutate(
+          viol_cc      = pmax(0, (1 - alpha) - cov_cc),
+          viol_overall = pmax(0, (1 - alpha) - cov_overall),
+          loss         = viol_cc + viol_overall + mean_size
+        )
+      
       chosen <- eval_tbl %>%
-        dplyr::arrange(dplyr::desc(cov_cc), mean_size) %>%
+        dplyr::arrange(loss, mean_size) %>%
         dplyr::slice(1)
     }
     
@@ -292,13 +314,12 @@ choose_lambda_by_selection <- function(
 }
 
 
-
 # ----------------------------
 # 6) Data generator
 # ----------------------------
 gen_data <- function(n, K = 50, d = 10,
                      prior = c("balanced","zipf"),
-                     noise = c("homog","hetero","hetero_tail"),
+                     noise = c("homog","hetero"),
                      sep = 1.8) {
   prior <- match.arg(prior)
   noise <- match.arg(noise)
@@ -340,25 +361,6 @@ gen_data <- function(n, K = 50, d = 10,
       sigmas[[k]] <- diag(d) * s
     }
     
-  } else if (noise == "hetero_tail") {
-    # head: sep 크고 variance 작음 (easy)
-    # tail: sep 줄이고 variance 크게 (hard)
-    for (k in 1:K) {
-      diff_k <- difficulty[k]          # 0(head) ~ 1(tail)
-      
-      # tail로 갈수록 sep를 줄여서(mean을 서로 더 붙게)
-      #   head: sep_k ≈ 1.1 * sep
-      #   tail: sep_k ≈ 0.4 * sep
-      sep_k <- sep * (1.1 - 0.7 * diff_k)
-      
-      # tail로 갈수록 분산 크게:
-      #   head: scale ≈ 0.7
-      #   tail: scale ≈ 6
-      scale_k <- 0.7 + 5.3 * diff_k^2
-      
-      mus[k, ]    <- sep_k * base_mus[k, ]
-      sigmas[[k]] <- diag(d) * scale_k
-    }
   }
   
   ## 5) 샘플링
@@ -614,8 +616,8 @@ grid <- tidyr::expand_grid(
   K    = c(30, 50),
   Kc   = c(3, 5, 7, 10),
   d    = 10,
-  noise = c("hetero"),
-  prior = "zipf"
+  prior = c("balanced","zipf"),
+  noise = c("homog","hetero")
 ) %>%
   filter(!(K == 30 & Kc == 10))
 
@@ -755,7 +757,7 @@ y_scale_cov <- scale_y_continuous(
 
 Ks_to_plot <- sort(unique(final_overall$K))
 d_vals     <- sort(unique(final_overall$d))
-noise_vals <- sort(unique(final_overall$noise))   # ==> c("hetero", "hetero_tail")
+noise_vals <- sort(unique(final_overall$noise)) 
 
 # --------------------------------------------------
 # 1) Overall plot
