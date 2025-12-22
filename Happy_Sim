@@ -75,9 +75,9 @@ G <- 50 #grid 개수
 p_grid <- seq(0.02, 0.98, length.out = G)
 x_grid <- as.numeric(quantile(data$x, probs = p_grid, na.rm = TRUE)) #전체 데이터 기반 x_grid 생성
 
-## --- 각 반복마다 5000개만 train/cal로 쓰고, 나머지를 test로 사용 --- ##
-B <- 1
-n_fit <- 5000
+## --- 각 반복마다 500개만? train/cal로 쓰고, 나머지를 test로 사용 --- ##
+B <- 100
+n_fit <- 500
 train_frac <- 0.5
 cal_frac <- 0.5
 h <- 0.2
@@ -92,7 +92,7 @@ lambda_vec <- rep(NA_real_, B)
 for (b in 1:B) {
   set.seed(100 + b)
   
-  # ---- 5000을 fit용으로 뽑고, 나머지는 test로 ----
+  # ---- 일부ㄴ fit용으로 뽑기 ----
   fit_idx <- sample.int(nrow(data), n_fit, replace = FALSE)
   data_fit <- data[fit_idx, ]
   
@@ -147,7 +147,7 @@ for (b in 1:B) {
     } else {
       loc_content <- mean(test_y[idx_loc] >= lower_test[idx_loc] &
                             test_y[idx_loc] <= upper_test[idx_loc], na.rm=TRUE)
-      pass_mat[b, j] <- as.integer(loc_content >= 0.85)
+      pass_mat[b, j] <- as.integer(loc_content >= 0.90)
     }
   }
 }
@@ -169,7 +169,7 @@ ggplot(diag_df, aes(x = x, y = prob_pass)) +
   geom_line() +
   geom_hline(yintercept = 0.95, linetype = "dashed") +
   ylim(0, 1) +
-  labs(y = "P{ local content >= 0.85 }")
+  labs(y = "P{ local content >= 0.90 }")
 
 ggplot(diag_df, aes(x = x, y = support_rate)) +
   geom_line() +
@@ -193,8 +193,8 @@ library(progressr)
 
 plan(multisession, workers = max(1L, parallel::detectCores() - 1L))
 
-B = 1
-p <- length(x_grid)
+B = 100
+p_grid <- length(x_grid)
 
 # b 하나를 수행해서 "길이 p 벡터 3개"를 반환하는 함수
 one_rep_gy <- function(b,
@@ -250,9 +250,9 @@ one_rep_gy <- function(b,
   gy_lower_test <- approx(x = gy_x, y = gy_lower, xout = test_x, rule = 2)$y
   
   # ---- per-xgrid outputs (length p) ----
-  pass_vec    <- rep(NA_integer_, p)
-  nloc_vec    <- rep(NA_integer_, p)
-  content_vec <- rep(NA_real_,    p)
+  pass_vec    <- rep(NA_integer_, p_grid)
+  nloc_vec    <- rep(NA_integer_, p_grid)
+  content_vec <- rep(NA_real_,    p_grid)
   
   for (j in seq_len(p)) {
     idx_loc <- abs(test_x - x_grid[j]) <= h
@@ -285,12 +285,12 @@ handlers(global = TRUE)
 handlers("txtprogressbar") 
 
 with_progress({
-  p <- progressor(along=seq_len(B))
+  prog <- progressor(along=seq_len(B))
   res_list <- future_lapply(
     X = seq_len(B),
     FUN = function(b, ...) {
       out <- one_rep_gy(b, ...)
-      p()                 # <- b 1개 끝날 때마다 진행 +1
+      prog()                 # <- b 1개 끝날 때마다 진행 +1
       out
     },
     data = data, n_fit = n_fit, x_grid = x_grid, h = h,
