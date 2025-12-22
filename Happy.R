@@ -60,18 +60,23 @@ x <- data_sample$x
 y <- data_sample$y
 n <- length(x)
 
-n_train <- floor(n*0.3)
-n_cal <- floor(n*0.4)
-n_test <- n - n_train - n_cal
+n_train <- floor(n*0.5)
+n_cal <- floor(n*0.5)
 
 idx <- sample(n)
 train_idx <- idx[1:n_train]
-cal_idx <- idx[(n_train + 1):(n_train + n_cal)]
-test_idx <- idx[(n_train + n_cal + 1):n]
+cal_idx <- idx[(n_train + 1):n]
 
 train_x <- x[train_idx]; train_y <- y[train_idx]
 cal_x <- x[cal_idx]; cal_y <- y[cal_idx]
-test_x <- x[test_idx]; test_y <- y[test_idx]
+
+test_data <- read_delim(file='photoz_data/Happy/Happy_B', delim=' ', comment='#', col_names=FALSE)
+colnames(test_data) <- c(
+  "id", "mag_r", "u_g", "g_r", "r_i", "i_z",
+  "z_spec", "feat1", "feat2", "feat3", "feat4", "feat5"
+)
+test_x <- test_data$mag_r
+test_y <- test_data$z_spec
 
 
 
@@ -186,4 +191,4 @@ p <- ggplot(combined_df, aes(x=x, y=y))+
                           "\nGY content : ", round(gy_content,3)),
            size=4.5, fontface='italic'); p
 
-ggsave(filename='0731_result.png', plot=p, width=10, height=8)
+ggsave(filename='1222_result.png', plot=p, width=10, height=8)
