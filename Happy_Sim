@@ -4,13 +4,8 @@ library(dplyr)
 library(ggplot2)
 library(MASS)
 library(tidyr)
-
-#####################
-#### 1. Ours #####
-#####################
-
 # ----- 함수 ----- #
-find_lambda <- function(alpha, delta, y, pred, variance, n, lower=0, upper=50, step=1e-3){
+find_lambda <- function(alpha, delta, y, pred, variance, n, lower=0, upper=30, step=1e-3){
   threshold <- max(0, alpha-sqrt(log(1/delta)/(2*n)))
   lambda_seq <- seq(lower, upper, by=step)
   for (lambda in lambda_seq){
@@ -28,37 +23,64 @@ compute_norm <- function(vector){
   return(sqrt(sum(vector^2)))
 }
 
-local_content_pass <- function(x0, x_test, y_test, lower, upper,
-                               h, content_target = 1-alpha,
-                               min_pts = 5) {
-  idx <- abs(x_test - x0) <= h
-  n_loc <- sum(idx)
-  if (n_loc < min_pts) return(NA_integer_)
+compute_norm_fast <- function(B, A, BtB){
+  # returns vector: ||S_{:,j}|| for j = 1,...,n
+  # S_{:,j} = B %*% A %*% t(B[j, ])
   
-  pass_cnt <- sum(
-    y_test[idx] >= lower[idx] &
-      y_test[idx] <= upper[idx],
-    na.rm = TRUE
-  )
+  M <- A %*% BtB %*% A          # small matrix (df x df)
   
-  as.integer(pass_cnt / n_loc >= content_target)
+  # 각 j에 대해: B[j, ] %*% M %*% t(B[j, ])
+  sqrt(rowSums((B %*% M) * B))
 }
 
-# ---- 데이터 불러오기 ---- #
+tf  <- function(y) log1p(y)
+itf <- function(z) expm1(z)
+
+
+
+library(readr)
+library(gam)
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(tidyr)
+
 local_path <- 'photoz_data'
 
+# data 
 data_path <- file.path(local_path, 'Happy', 'happy_A')
 data <- read_delim(data_path, delim=' ', comment='#', col_names=FALSE, trim_ws=TRUE)
 colnames(data) <- c(
   "id", "mag_r", "u_g", "g_r", "r_i", "i_z",
   "z_spec", "feat1", "feat2", "feat3", "feat4", "feat5"
 )
+
+# data visualization
+ggplot(data, aes(x=mag_r, y=z_spec))+
+  geom_point(alpha=0.2)
+
 data <- data.frame(x=data$mag_r, y=data$z_spec)
-ggplot(data, aes(x=x))+
-  geom_density()
+
+# data sampling
+set.seed(123)
+data_sample <- data %>% sample_n(5000)
+
+x <- data_sample$x
+y <- data_sample$y
+n <- length(x)
+
+n_train <- floor(n*0.5)
+n_cal <- floor(n*0.5)
+
+idx <- sample(n)
+train_idx <- idx[1:n_train]
+cal_idx <- idx[(n_train + 1):(n_train + n_cal)]
+train_x <- x[train_idx]; train_y <- y[train_idx]
+cal_x <- x[cal_idx]; cal_y <- y[cal_idx]
+
 
 #test data
-test_data <- read_delim(file='photoz_data/Happy/Happy_B', delim=' ', comment='#', col_names=FALSE)
+test_data <- read_delim(file='photoz_data/Happy/happy_B', delim=' ', comment='#', col_names=FALSE)
 colnames(test_data) <- c(
   "id", "mag_r", "u_g", "g_r", "r_i", "i_z",
   "z_spec", "feat1", "feat2", "feat3", "feat4", "feat5"
@@ -67,265 +89,262 @@ test_x <- test_data$mag_r
 test_y <- test_data$z_spec
 
 
-# ---- 시뮬레이션 전 준비 ---- #
-alpha <- 0.10
-delta <- 0.05
+#####################
+#### 1. Ours #####
+#####################
 
-G <- 50 #grid 개수 
-p_grid <- seq(0.02, 0.98, length.out = G)
-x_grid <- as.numeric(quantile(data$x, probs = p_grid, na.rm = TRUE)) #전체 데이터 기반 x_grid 생성
-
-## --- 각 반복마다 500개만? train/cal로 쓰고, 나머지를 test로 사용 --- ##
-B <- 100
-n_fit <- 500
-train_frac <- 0.5
-cal_frac <- 0.5
-h <- 0.2
-min_pts <- 5
-
-pass_mat <- matrix(NA_integer_, nrow = B, ncol = length(x_grid))
-nloc_mat <- matrix(NA_integer_, nrow = B, ncol = length(x_grid))
-lambda_vec <- rep(NA_real_, B)
-
-
-## --- 시뮬레이션 실행 --- ##
-for (b in 1:B) {
-  set.seed(100 + b)
+# ----- 한 번 실행 함수로 감싸기 -----
+one_run <- function(seed_split){
   
-  # ---- 일부ㄴ fit용으로 뽑기 ----
-  fit_idx <- sample.int(nrow(data), n_fit, replace = FALSE)
-  data_fit <- data[fit_idx, ]
+  set.seed(seed_split)
+  # (0) 매번 Happy A에서 새로 5000 샘플링
+  data_sample <- data %>% sample_n(5000)
   
-  x_fit <- data_fit$x; y_fit <- data_fit$y
+  x_all <- data_sample$x
+  y_all <- data_sample$y
+  n <- length(x_all)
   
-  # ---- fit(=train/cal) split ----
-  n <- length(x_fit)
-  n_train <- floor(n * train_frac)
-  n_cal   <- floor(n * cal_frac)
-  idx <- sample.int(n)
+  n_train <- floor(n * 0.5)
+  n_cal   <- n - n_train
   
+  idx <- sample(n)
   train_idx <- idx[1:n_train]
-  cal_idx   <- idx[(n_train+1):(n_train+n_cal)]
+  cal_idx   <- idx[(n_train + 1):(n_train + n_cal)]
   
-  train_x <- x_fit[train_idx]; train_y <- y_fit[train_idx]
-  cal_x   <- x_fit[cal_idx];   cal_y   <- y_fit[cal_idx]
+  train_x <- x_all[train_idx]; train_y <- y_all[train_idx]
+  cal_x   <- x_all[cal_idx];   cal_y   <- y_all[cal_idx]
   
+  # ---- test set (Happy B) ----
+  test_x <- test_data$mag_r
+  test_y <- test_data$z_spec
   
-  # ---- 평균/분산 적합 ----
-  fit <- smooth.spline(train_x, train_y)
-  train_res <- train_y - predict(fit, train_x)$y
+  alpha <- 0.10
+  delta <- 0.05
   
-  eps <- 1e-6
-  var_fit <- gam(log(train_res^2 + eps) ~ s(train_x))
-  
-  mean_pred_cal <- predict(fit, cal_x)$y
-  log_var_cal <- as.numeric(predict(var_fit, newdata=data.frame(train_x=cal_x)))
-  var_pred_cal <- pmax(exp(log_var_cal), 1e-6)
-  
-  
-  # ---- lambda 추정 ----
-  lambda_hat <- find_lambda(alpha, delta, cal_y, mean_pred_cal, var_pred_cal, n=length(cal_x))
-  lambda_vec[b] <- lambda_hat
-  if (!is.finite(lambda_hat)) next  # 이번 반복 스킵(필수)
-  
-  # ---- test에서 밴드 구성 ----
-  mean_pred_test <- predict(fit, test_x)$y
-  log_var_test <- as.numeric(predict(var_fit, newdata=data.frame(train_x=test_x)))
-  var_pred_test <- pmax(exp(log_var_test), 1e-6)
-  
-  upper_test <- mean_pred_test + sqrt(var_pred_test) * lambda_hat
-  lower_test <- mean_pred_test - sqrt(var_pred_test) * lambda_hat
+  # ===== log1p transform =====
+  train_z <- tf(train_y)
+  cal_z   <- tf(cal_y)
+  test_z  <- tf(test_y)
   
   
-  # ---- pointwise pass + n_loc ----
-  for (j in seq_along(x_grid)) {
-    idx_loc <- abs(test_x - x_grid[j]) <= h
-    nloc_mat[b, j] <- sum(idx_loc)
-    
-    if (nloc_mat[b, j] < min_pts) {
-      pass_mat[b, j] <- NA_integer_
-    } else {
-      loc_content <- mean(test_y[idx_loc] >= lower_test[idx_loc] &
-                            test_y[idx_loc] <= upper_test[idx_loc], na.rm=TRUE)
-      pass_mat[b, j] <- as.integer(loc_content >= 0.90)
-    }
+  # ---------------------------
+  # (1) Ours (on z-scale)
+  # ---------------------------
+  
+  fit <- smooth.spline(train_x, train_z)
+  
+  train_res <- train_z - predict(fit, train_x)$y
+  var_fit <- gam(train_res^2 ~ s(train_x))
+  
+  mean_pred_z <- predict(fit, cal_x)$y
+  var_pred    <- predict(var_fit, newdata = data.frame(train_x = cal_x))
+  var_pred[var_pred < 0] <- 1e-6
+  
+  lambda_hat <- find_lambda(
+    alpha, delta,
+    y = cal_z,
+    pred = mean_pred_z,
+    variance = var_pred,
+    n = n_cal,
+    lower = 0, upper = 30, step = 1e-3
+  )
+  
+  if (is.na(lambda_hat)) {
+    return(data.frame(
+      seed = seed_split,
+      ours_cov = NA_real_, ours_w = NA_real_,
+      gy_cov   = NA_real_, gy_w   = NA_real_,
+      lambda_hat = NA_real_
+    ))
   }
+  
+  upper_cal_z <- mean_pred_z + sqrt(var_pred) * lambda_hat
+  lower_cal_z <- mean_pred_z - sqrt(var_pred) * lambda_hat
+  
+  # interpolate on z-scale, then back-transform
+  upper_ours_z <- approx(x = cal_x, y = upper_cal_z, xout = test_x, rule = 2)$y
+  lower_ours_z <- approx(x = cal_x, y = lower_cal_z, xout = test_x, rule = 2)$y
+  
+  upper_ours <- itf(upper_ours_z)
+  lower_ours <- itf(lower_ours_z)
+  
+  # optional clipping to enforce nonnegative lower bound
+  lower_ours <- pmax(lower_ours, 0)
+  
+  ours_cov <- mean(test_y >= lower_ours & test_y <= upper_ours, na.rm = TRUE)
+  ours_w   <- mean(upper_ours - lower_ours, na.rm = TRUE)
+  
+  # ---------------------------
+  # (2) GY (on z-scale)
+  # ---------------------------
+  proper_train_idx <- idx[1:(n_train + n_cal)]
+  gy_x <- x_all[proper_train_idx]
+  gy_y <- y_all[proper_train_idx]
+  gy_z <- tf(gy_y)
+  
+  gy_fit <- smooth.spline(x = gy_x, y = gy_z)
+  gy_train_residual <- gy_z - predict(gy_fit, gy_x)$y
+  
+  gy_var_fit <- gam(gy_train_residual^2 ~ s(gy_x))
+  gy_variance_hat <- predict(gy_var_fit, newdata = data.frame(gy_x = gy_x))
+  gy_variance_hat <- pmax(gy_variance_hat, 1e-6)
+  
+  transform_y <- gy_z / sqrt(gy_variance_hat)
+  gy_fit_trans <- smooth.spline(x = gy_x, y = transform_y)
+  
+  Bmat <- bs(gy_x, df = gy_fit_trans$df)
+  D <- diff(diag(ncol(Bmat)), differences = 2)
+  
+  BtB <- crossprod(Bmat)
+  A   <- ginv(BtB + gy_fit_trans$lambda * crossprod(D))
+  
+  residuals2 <- transform_y - predict(gy_fit_trans, gy_x)$y
+  est_var <- as.numeric(crossprod(residuals2) / (nrow(Bmat) - 1))
+  
+  nu <- length(gy_x) - 1
+  
+  norm_lx_h_values <- compute_norm_fast(Bmat, A, BtB)
+  
+  k_factors <- find_k_factor(
+    nu,
+    norm_lx_h_values,
+    P = 1 - alpha,
+    gamma = delta
+  )
+  
+  gy_mean_pred <- predict(gy_fit_trans, gy_x)$y
+  gy_upper_t <- gy_mean_pred + sqrt(est_var) * k_factors
+  gy_lower_t <- gy_mean_pred - sqrt(est_var) * k_factors
+  
+  # back to z-scale
+  gy_upper_z <- gy_upper_t * sqrt(gy_variance_hat)
+  gy_lower_z <- gy_lower_t * sqrt(gy_variance_hat)
+  
+  # interpolate on z-scale to test_x
+  upper_gy_z <- approx(x = gy_x, y = gy_upper_z, xout = test_x, rule = 2)$y
+  lower_gy_z <- approx(x = gy_x, y = gy_lower_z, xout = test_x, rule = 2)$y
+  
+  # back-transform to original y scale
+  upper_gy <- itf(upper_gy_z)
+  lower_gy <- itf(lower_gy_z)
+  lower_gy <- pmax(lower_gy, 0)
+  
+  gy_cov <- mean(test_y >= lower_gy & test_y <= upper_gy, na.rm = TRUE)
+  gy_w   <- mean(upper_gy - lower_gy, na.rm = TRUE)
+  
+  data.frame(
+    seed = seed_split,
+    ours_cov = ours_cov, ours_w = ours_w,
+    gy_cov   = gy_cov,   gy_w   = gy_w,
+    lambda_hat = lambda_hat
+  )
 }
 
-# ---- 결과 확인 ---- #
-prob_pass    <- colMeans(pass_mat, na.rm = TRUE)
-support_rate <- colMeans(nloc_mat >= min_pts, na.rm = TRUE)
-avg_nloc     <- colMeans(nloc_mat, na.rm = TRUE)
-
-diag_df <- data.frame(
-  x = x_grid,
-  prob_pass = prob_pass,
-  support_rate = support_rate,
-  avg_nloc = avg_nloc
-)
-
-
-ggplot(diag_df, aes(x = x, y = prob_pass)) +
-  geom_line() +
-  geom_hline(yintercept = 0.95, linetype = "dashed") +
-  ylim(0, 1) +
-  labs(y = "P{ local content >= 0.90 }")
-
-ggplot(diag_df, aes(x = x, y = support_rate)) +
-  geom_line() +
-  ylim(0, 1) +
-  labs(y = "Support rate: P{n_loc >= min_pts}")
-
-ggplot(diag_df, aes(x = x, y = avg_nloc)) +
-  geom_line() +
-  labs(y = "E[n_loc]")
-
-
-#####################
-#### 2. GY #####
-#####################
-library(mgcv)        # gam
-library(splines)     # bs
-library(MASS)        # ginv
+# 병렬처리 # 
 library(future)
 library(future.apply)
-library(progressr)
+library(dplyr)
+
+seeds <- 1:100
 
 plan(multisession, workers = max(1L, parallel::detectCores() - 1L))
 
-B = 100
-p_grid <- length(x_grid)
+res <- bind_rows(future_lapply(seeds, one_run, future.seed = TRUE))
 
-# b 하나를 수행해서 "길이 p 벡터 3개"를 반환하는 함수
-one_rep_gy <- function(b,
-                       data, n_fit, x_grid, h, min_pts, alpha, delta) {
-  
-  set.seed(100 + b)
-  
-  fit_idx   <- sample.int(nrow(data), n_fit, replace = FALSE)
-  data_fit  <- data[fit_idx, ]
-  
-  gy_x   <- data_fit$x;  gy_y   <- data_fit$y
-  
-  # ---- (GY) mean fit on original scale ----
-  gy_fit <- smooth.spline(x = gy_x, y = gy_y)
-  gy_train_residual <- gy_y - predict(gy_fit, gy_x)$y
-  
-  # ---- (GY) variance fit on residual^2 ----
-  gy_var_fit <- gam(gy_train_residual^2 ~ s(gy_x))
-  gy_variance_hat <- as.numeric(predict(gy_var_fit, newdata = data.frame(gy_x = gy_x)))
-  gy_variance_hat[!is.finite(gy_variance_hat) | gy_variance_hat < 0] <- 1e-6
-  
-  # ---- (GY) transform and fit spline on transformed ----
-  transform_y  <- gy_y / sqrt(gy_variance_hat)
-  gy_fit_trans <- smooth.spline(x = gy_x, y = transform_y)
-  
-  # ---- (GY) compute k-factors ----
-  Bmat <- bs(gy_x, df = gy_fit_trans$df)
-  D <- diff(diag(ncol(Bmat)), differences = 2)
-  S_inv <- ginv(t(Bmat) %*% Bmat + gy_fit_trans$lambda * t(D) %*% D)
-  S <- Bmat %*% S_inv %*% t(Bmat)
-  
-  I_n <- diag(length(gy_x))
-  R <- I_n - S
-  
-  residuals2 <- transform_y - predict(gy_fit_trans, gy_x)$y
-  est_var <- as.numeric((t(residuals2) %*% residuals2) / sum(diag(t(R) %*% R)))
-  
-  nu <- length(gy_x) - 1
-  norm_lx_h_values <- sqrt(diag(t(S) %*% S))
-  k_factors <- find_k_factor(nu, norm_lx_h_values, P = 1 - alpha, gamma = delta)
-  
-  # ---- (GY) build band on training points (gy_x) ----
-  gy_mean_pred_trans <- predict(gy_fit_trans, gy_x)$y
-  gy_upper <- as.vector(gy_mean_pred_trans + sqrt(est_var) * k_factors)
-  gy_lower <- as.vector(gy_mean_pred_trans - sqrt(est_var) * k_factors)
-  
-  # back-transform
-  gy_upper <- gy_upper * sqrt(gy_variance_hat)
-  gy_lower <- gy_lower * sqrt(gy_variance_hat)
-  
-  # ---- (GY) evaluate band at test_x via interpolation ----
-  gy_upper_test <- approx(x = gy_x, y = gy_upper, xout = test_x, rule = 2)$y
-  gy_lower_test <- approx(x = gy_x, y = gy_lower, xout = test_x, rule = 2)$y
-  
-  # ---- per-xgrid outputs (length p) ----
-  pass_vec    <- rep(NA_integer_, p_grid)
-  nloc_vec    <- rep(NA_integer_, p_grid)
-  content_vec <- rep(NA_real_,    p_grid)
-  
-  for (j in seq_len(p)) {
-    idx_loc <- abs(test_x - x_grid[j]) <= h
-    nloc_vec[j] <- sum(idx_loc)
-    
-    if (nloc_vec[j] >= min_pts) {
-      ok <- idx_loc & is.finite(gy_lower_test) & is.finite(gy_upper_test) & is.finite(test_y)
-      if (sum(ok) >= min_pts) {
-        content_vec[j] <- mean(test_y[ok] >= gy_lower_test[ok] & test_y[ok] <= gy_upper_test[ok])
-      }
-    }
-    
-    pass_vec[j] <- local_content_pass(
-      x0 = x_grid[j],
-      x_test = test_x,
-      y_test = test_y,
-      lower = gy_lower_test,
-      upper = gy_upper_test,
-      h = h,
-      content_target = 0.90,
-      min_pts = min_pts
-    )
-  }
-  
-  list(pass = pass_vec, nloc = nloc_vec, content = content_vec)
-}
+plan(sequential)
 
-# ---- 병렬 실행 ----
-handlers(global = TRUE)
-handlers("txtprogressbar") 
 
-with_progress({
-  prog <- progressor(along=seq_len(B))
-  res_list <- future_lapply(
-    X = seq_len(B),
-    FUN = function(b, ...) {
-      out <- one_rep_gy(b, ...)
-      prog()                 # <- b 1개 끝날 때마다 진행 +1
-      out
-    },
-    data = data, n_fit = n_fit, x_grid = x_grid, h = h,
-    min_pts = min_pts, alpha = alpha, delta = delta,
-    future.seed = TRUE   # 병렬에서도 재현성 유지
+# ----- 요약 (평균/표준오차) -----
+summ <- res %>%
+  summarise(
+    B = n(),
+    fail_lambda = mean(is.na(lambda_hat)),
+    ours_cov_mean = mean(ours_cov, na.rm=TRUE),
+    ours_cov_se   = sd(ours_cov, na.rm=TRUE) / sqrt(sum(!is.na(ours_cov))),
+    ours_w_mean   = mean(ours_w, na.rm=TRUE),
+    ours_w_se     = sd(ours_w, na.rm=TRUE) / sqrt(sum(!is.na(ours_w))),
+    gy_cov_mean   = mean(gy_cov, na.rm=TRUE),
+    gy_cov_se     = sd(gy_cov, na.rm=TRUE) / sqrt(sum(!is.na(gy_cov))),
+    gy_w_mean     = mean(gy_w, na.rm=TRUE),
+    gy_w_se       = sd(gy_w, na.rm=TRUE) / sqrt(sum(!is.na(gy_w)))
   )
-})
 
-# ---- 리스트 -> 행렬로 복원 ----
-pass_mat_gy    <- do.call(rbind, lapply(res_list, `[[`, "pass"))
-nloc_mat_gy    <- do.call(rbind, lapply(res_list, `[[`, "nloc"))
-content_mat_gy <- do.call(rbind, lapply(res_list, `[[`, "content"))
+print(summ)
 
-diag_df_gy <- data.frame(
-  x = x_grid,
-  prob_pass    = colMeans(pass_mat_gy, na.rm = TRUE),
-  support_rate = colMeans(nloc_mat_gy >= min_pts, na.rm = TRUE),
-  avg_nloc     = colMeans(nloc_mat_gy, na.rm = TRUE),
-  mean_content = colMeans(content_mat_gy, na.rm = TRUE)
-)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
 
-# ---- 플롯 ----
-ggplot(diag_df_gy, aes(x = x, y = prob_pass)) +
-  geom_line() +
-  geom_hline(yintercept = 0.95, linetype = "dashed") +
-  ylim(0, 1) +
-  labs(y = "P{ local content >= 0.90 } (GY)")
+# (0) long format
+plot_df <- res %>%
+  dplyr::select(seed, ours_cov, gy_cov, ours_w, gy_w) %>%
+  pivot_longer(
+    cols = -seed,
+    names_to = c("method", "metric"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = recode(method, ours = "Ours", gy = "GY"),
+    method = factor(method, levels = c("Ours", "GY")),
+    metric = recode(metric,
+                    cov = "Coverage",
+                    w   = "Width")
+  )
 
-ggplot(diag_df_gy, aes(x = x, y = mean_content)) +
-  geom_line() +
-  geom_hline(yintercept = 0.90, linetype = "dashed") +
-  ylim(0, 1) +
-  labs(y = "E[ local content ] (GY)")
+fill_cols <- c("Ours" = "tomato", "GY" = "skyblue")
 
-ggplot(diag_df_gy, aes(x = x, y = support_rate)) +
-  geom_line() +
-  ylim(0, 1) +
-  labs(y = "Support rate")
+# 공통 theme (논문용)
+theme_paper <- theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_line(linewidth = 0.2),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    plot.margin = margin(5.5, 6, 5.5, 6)
+  )
+
+# (1) Coverage panel
+df_cov <- plot_df %>% filter(metric == "Coverage")
+
+p_cov <- ggplot(df_cov, aes(x = method, y = value, fill = method)) +
+  geom_boxplot(
+    width = 0.55, alpha = 0.55, outlier.shape = NA,
+    linewidth = 0.35, color = "grey25"
+  ) +
+  # 점은 조금만, 겹침 줄이기
+  geom_point(
+    position = position_jitter(width = 0.12, height = 0),
+    size = 1.1, alpha = 0.35, color = "grey15"
+  ) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", linewidth = 0.5) +
+  scale_fill_manual(values = fill_cols) +
+  labs(title = "Coverage", y = "Marginal coverage") +
+  # 보기 좋게 범위 자동 + 약간 여유
+  coord_cartesian(ylim = range(df_cov$value, na.rm = TRUE) + c(-0.01, 0.01)) +
+  theme_paper
+
+# (2) Width panel
+df_w <- plot_df %>% filter(metric == "Width")
+
+p_w <- ggplot(df_w, aes(x = method, y = value, fill = method)) +
+  geom_boxplot(
+    width = 0.55, alpha = 0.55, outlier.shape = NA,
+    linewidth = 0.35, color = "grey25"
+  ) +
+  geom_point(
+    position = position_jitter(width = 0.12, height = 0),
+    size = 1.1, alpha = 0.35, color = "grey15"
+  ) +
+  scale_fill_manual(values = fill_cols) +
+  labs(title = "Width", y = "Mean interval width") +
+  coord_cartesian(ylim = range(df_w$value, na.rm = TRUE) + c(-0.02, 0.02)) +
+  theme_paper
+
+# (3) Combine
+p_final <- p_cov + p_w + plot_layout(ncol = 2)
+p_final
